@@ -6,13 +6,11 @@ dist/
 build/
 *.egg-info/
 .pytest_cache/
+uv.lock
 
-# beads / dolt (this repo's workspace connects to the shared server; no local data)
-.beads/proxieddb/
-.beads/*.db
-.beads/backup/
+# beads workspace: machine-local connection config to the shared dolt server.
+# Set up per machine with `bd init --global` (see README). Not committed.
+.beads/
 .dolt/
-.beads-credential-key
-
-# Beads / Dolt files (added by bd init)
 *.db
+.beads-credential-key
