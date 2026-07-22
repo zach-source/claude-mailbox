@@ -14,6 +14,7 @@ L_MESSAGE = "mailbox:message"  # a broadcast or DM (ephemeral event bead)
 L_LEADER_SLOT = "mailbox:leader-slot"  # the singleton leadership lock bead
 L_DM = "dm"  # marks a message as a direct message
 L_DELEGATION = "mailbox:delegation"  # leader → secondary work item
+L_REQUEST = "mailbox:request"  # blocking info-request (answered via comment + close)
 
 # state dimensions (bd set-state <id> <dim>=<val>)
 D_STATUS = "status"  # active | idle | blocked | done

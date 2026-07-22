@@ -18,4 +18,7 @@ build-backend = "hatchling.build"
 packages = ["src/claude_mailbox"]
 
 [dependency-groups]
-dev = ["black", "pytest"]
+dev = ["black", "pytest", "pytest-asyncio"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

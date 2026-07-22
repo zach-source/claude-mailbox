@@ -13,6 +13,7 @@ from __future__ import annotations
 import atexit
 import json
 import threading
+import time
 
 from fastmcp import FastMCP
 
@@ -319,7 +320,7 @@ def poll_inbox(mark_read: bool = True) -> dict:
     """Read messages/delegations addressed to this session. Closes DMs when
     mark_read is true (a closed DM = read)."""
     rows = run_bd_json("query", f"assignee={S.sid} AND status=open") or []
-    dms, delegations = [], []
+    dms, delegations, requests = [], [], []
     for r in rows:
         labels = r.get("labels") or []
         try:
@@ -331,13 +332,78 @@ def poll_inbox(mark_read: bool = True) -> dict:
             "from": meta.get("from"),
             "text": meta.get("text") or r.get("title"),
         }
-        if m.L_DELEGATION in labels:
+        if m.L_REQUEST in labels:
+            # An info-request: the sender is gate-blocked. Answer with respond_info.
+            requests.append(item)
+        elif m.L_DELEGATION in labels:
             delegations.append(item)
         elif m.L_DM in labels:
             dms.append(item)
             if mark_read:
                 run_bd("close", r["id"], actor=S.sid, check=False)
-    return {"dms": dms, "delegations": delegations}
+    return {"dms": dms, "delegations": delegations, "requests": requests}
+
+
+def _bead_status(bead_id: str) -> str | None:
+    rows = run_bd_json("show", bead_id)
+    bead = rows[0] if isinstance(rows, list) and rows else rows
+    return bead.get("status") if isinstance(bead, dict) else None
+
+
+def _last_answer(bead_id: str) -> str | None:
+    comments = run_bd_json("comments", bead_id) or []
+    return comments[-1].get("text") if comments else None
+
+
+@mcp.tool
+def request_info(to_sid: str, question: str, timeout_s: int = 60) -> dict:
+    """Ask another session a question and block (up to timeout_s) for its answer.
+
+    Creates a request bead assigned to the target (surfaces in their poll_inbox);
+    they reply via respond_info, which comments the answer and closes the bead.
+    Returns {request_id, answer, resolved, timed_out}. If it times out, keep the
+    request_id and poll later with check_request — the request stays open.
+    """
+    payload = json.dumps({"text": question, "from": S.sid})
+    rid = create(
+        f"[req] to {to_sid}: {question}"[:200],
+        type="task",
+        labels=[m.L_REQUEST, m.from_label(S.sid)],
+        ephemeral=True,
+        description=payload,
+        actor=S.sid,
+    )
+    run_bd("assign", rid, to_sid, actor=S.sid, check=False)
+    deadline = time.time() + max(0, timeout_s)
+    while time.time() < deadline:
+        time.sleep(3)
+        if _bead_status(rid) == "closed":
+            return {
+                "request_id": rid,
+                "answer": _last_answer(rid),
+                "resolved": True,
+                "timed_out": False,
+            }
+    return {"request_id": rid, "answer": None, "resolved": False, "timed_out": True}
+
+
+@mcp.tool
+def respond_info(request_id: str, answer: str) -> dict:
+    """Answer an info-request (from poll_inbox 'requests'): comment + close,
+    which unblocks the asking session."""
+    run_bd("comment", request_id, answer, actor=S.sid)
+    run_bd("close", request_id, actor=S.sid, check=False)
+    return {"ok": True}
+
+
+@mcp.tool
+def check_request(request_id: str) -> dict:
+    """Non-blocking: has an info-request been answered yet?"""
+    resolved = _bead_status(request_id) == "closed"
+    return {
+        "resolved": resolved,
+        "answer": _last_answer(request_id) if resolved else None,
+    }
 
 
 @mcp.tool
