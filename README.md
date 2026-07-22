@@ -16,7 +16,7 @@ a thin, typed wrapper around the `bd` CLI — no schema of our own.
 
 ## Layout
 ```
-src/mailbox/
+src/claude_mailbox/
   bd.py        # `bd --global -C <workspace>` wrapper (+ --json)
   identity.py  # session id + git project/branch/worktree detection
   model.py     # label/state naming conventions + heartbeat math
@@ -26,6 +26,12 @@ src/mailbox/
 skills/        # `mailbox` + `mailbox-leader` Claude skills
 docs/DESIGN.md # full design (data model, protocol, risks)
 ```
+
+The server resolves its `bd` workspace from the repo itself, via
+`WORKSPACE = Path(__file__).parents[2]` in `bd.py` — overridable with the
+`MAILBOX_WORKSPACE` env var. This is why the invocation below runs it with
+`uv run --project <repo>`; a bare wheel install (no repo checkout alongside
+it) would need `MAILBOX_WORKSPACE` set explicitly.
 
 ## Run
 ```bash

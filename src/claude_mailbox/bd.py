@@ -31,7 +31,7 @@ class BdError(RuntimeError):
 def run_bd(*args: str, actor: str | None = None, check: bool = True) -> str:
     """Run `bd --global -C WORKSPACE [--actor A] <args>` and return stdout.
 
-    Raises BdError on non-zero exit (unless check=False, which returns stderr).
+    Raises BdError on non-zero exit (unless check=False, which returns "").
     """
     cmd = [BD, "--global", "-C", WORKSPACE]
     if actor:
@@ -41,7 +41,7 @@ def run_bd(*args: str, actor: str | None = None, check: bool = True) -> str:
     if proc.returncode != 0:
         if check:
             raise BdError(f"{' '.join(cmd)}\n{proc.stderr.strip()}")
-        return proc.stderr.strip()
+        return ""
     return proc.stdout.strip()
 
 
@@ -69,7 +69,10 @@ def create(
         args += ["-d", description]
     res = run_bd_json(*args, actor=actor)
     if isinstance(res, dict):
-        return res.get("id") or res.get("bead", {}).get("id")
+        bid = res.get("id") or res.get("bead", {}).get("id")
+        if not bid:
+            raise BdError(f"bd create returned no id: {res!r}")
+        return bid
     if isinstance(res, list) and res:
         return res[0].get("id")
     raise BdError(f"could not parse created bead id from: {res!r}")

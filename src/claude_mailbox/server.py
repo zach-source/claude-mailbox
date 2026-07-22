@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import logging
 import signal
 import sys
 import threading
@@ -24,6 +25,8 @@ from . import model as m
 from .bd import BdError, create, run_bd, run_bd_json
 from .identity import GitContext, detect_git, hostname, new_sid
 
+logger = logging.getLogger("claude_mailbox")
+
 mcp = FastMCP("claude-mailbox")
 
 
@@ -35,6 +38,7 @@ class _State:
         self.meta: dict = {}
         self._hb_thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._lock = threading.Lock()
 
 
 S = _State()
@@ -84,16 +88,17 @@ def _heartbeat_once() -> dict:
     run_bd(
         "set-state", S.bead_id, f"{m.D_HB}={m.hb_now()}", "--reason", "hb", actor=S.sid
     )
-    lead = L.heartbeat_leader(S.sid, S.git.branch, S.sid)
-    run_bd(
-        "set-state",
-        S.bead_id,
-        f"{m.D_ROLE}={lead['role']}",
-        "--reason",
-        "role sync",
-        actor=S.sid,
-        check=False,
-    )
+    with S._lock:
+        lead = L.heartbeat_leader(S.sid, S.git.branch, S.sid)
+        run_bd(
+            "set-state",
+            S.bead_id,
+            f"{m.D_ROLE}={lead['role']}",
+            "--reason",
+            "role sync",
+            actor=S.sid,
+            check=False,
+        )
     return {"ok": True, "role": lead["role"]}
 
 
@@ -101,8 +106,10 @@ def _hb_loop() -> None:
     while not S._stop.wait(m.HB_BUCKET):
         try:
             _heartbeat_once()
-        except Exception:  # never let the daemon thread die on a transient bd error
-            pass
+        except (
+            Exception
+        ) as exc:  # never let the daemon thread die on a transient bd error
+            logger.warning("heartbeat failed: %s", exc)
 
 
 def _reap_stale() -> None:
@@ -174,16 +181,17 @@ def register_session(objective: str) -> dict:
         "start",
         actor=S.sid,
     )
-    lead = L.heartbeat_leader(S.sid, g.branch, S.sid)
-    run_bd(
-        "set-state",
-        S.bead_id,
-        f"{m.D_ROLE}={lead['role']}",
-        "--reason",
-        "start",
-        actor=S.sid,
-        check=False,
-    )
+    with S._lock:
+        lead = L.heartbeat_leader(S.sid, g.branch, S.sid)
+        run_bd(
+            "set-state",
+            S.bead_id,
+            f"{m.D_ROLE}={lead['role']}",
+            "--reason",
+            "start",
+            actor=S.sid,
+            check=False,
+        )
     _reap_stale()
     if not S._hb_thread:
         S._hb_thread = threading.Thread(target=_hb_loop, daemon=True)
@@ -250,6 +258,8 @@ def set_status(status: str) -> dict:
 @mcp.tool
 def list_sessions(include_stale: bool = False, project: str | None = None) -> list:
     """List other live Claude sessions: who is working, on what, where."""
+    if project is not None and not m.valid_token(project):
+        return {"ok": False, "error": "invalid project: must match [A-Za-z0-9._-]"}
     q = f"label={m.L_SESSION} AND status=open"
     if project:
         q += f" AND label=project:{project}"
@@ -266,18 +276,22 @@ def get_leader() -> dict:
 @mcp.tool
 def claim_leadership(force: bool = False) -> dict:
     """Attempt to become leader. Only succeeds on the main branch unless force."""
-    return L.claim(S.sid, S.git.branch, S.sid, force=force)
+    with S._lock:
+        return L.claim(S.sid, S.git.branch, S.sid, force=force)
 
 
 @mcp.tool
 def release_leadership() -> dict:
     """Voluntarily give up leadership."""
-    return L.release(S.sid, S.sid)
+    with S._lock:
+        return L.release(S.sid, S.sid)
 
 
 @mcp.tool
 def broadcast(text: str, channel: str = "general") -> dict:
     """Broadcast a message to a channel that all sessions can read."""
+    if not m.valid_token(channel):
+        return {"ok": False, "error": "invalid channel: must match [A-Za-z0-9._-]"}
     payload = json.dumps({"text": text, "from": S.sid, "channel": channel})
     mid = create(
         f"[msg] {channel}: {text}"[:200],
@@ -293,12 +307,15 @@ def broadcast(text: str, channel: str = "general") -> dict:
 @mcp.tool
 def read_channel(channel: str, limit: int = 20) -> list:
     """Read recent messages on a channel (newest first)."""
+    if not m.valid_token(channel):
+        return {"ok": False, "error": "invalid channel: must match [A-Za-z0-9._-]"}
     rows = (
         run_bd_json(
             "query", f"label={m.L_MESSAGE} AND label={m.channel_label(channel)}"
         )
         or []
     )
+    rows.sort(key=lambda r: r.get("created_at") or "", reverse=True)
     msgs = []
     for r in rows[:limit]:
         try:
@@ -310,6 +327,7 @@ def read_channel(channel: str, limit: int = 20) -> list:
                 "id": r["id"],
                 "from": meta.get("from"),
                 "text": meta.get("text") or r.get("title"),
+                "ts": r.get("created_at"),
             }
         )
     return msgs
@@ -318,6 +336,8 @@ def read_channel(channel: str, limit: int = 20) -> list:
 @mcp.tool
 def send_dm(to_sid: str, text: str) -> dict:
     """Send a direct message to a specific session."""
+    if not m.valid_token(to_sid):
+        return {"ok": False, "error": "invalid to_sid: must match [A-Za-z0-9._-]"}
     payload = json.dumps({"text": text, "from": S.sid})
     mid = create(
         f"[dm] to {to_sid}: {text}"[:200],
@@ -390,6 +410,8 @@ def request_info(to_sid: str, question: str, timeout_s: int = 60) -> dict:
     Returns {request_id, answer, resolved, timed_out}. If it times out, keep the
     request_id and poll later with check_request — the request stays open.
     """
+    if not m.valid_token(to_sid):
+        return {"ok": False, "error": "invalid to_sid: must match [A-Za-z0-9._-]"}
     payload = json.dumps({"text": question, "from": S.sid})
     rid = create(
         f"[req] to {to_sid}: {question}"[:200],
@@ -441,6 +463,8 @@ def check_request(request_id: str) -> dict:
 @mcp.tool
 def delegate(to_sid: str, title: str, detail: str = "", priority: int = 2) -> dict:
     """Leader-only: assign a work item to a secondary session."""
+    if not m.valid_token(to_sid):
+        return {"ok": False, "error": "invalid to_sid: must match [A-Za-z0-9._-]"}
     lead = L.read_leader(S.sid)
     if lead.get("leader_sid") != S.sid:
         return {"ok": False, "error": "not the leader"}
@@ -471,7 +495,8 @@ def _deregister() -> dict:
     S._stop.set()
     if not S.bead_id:
         return {"ok": True}
-    L.release(S.sid, S.sid)
+    with S._lock:
+        L.release(S.sid, S.sid)
     run_bd(
         "set-state",
         S.bead_id,

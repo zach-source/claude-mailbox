@@ -44,6 +44,9 @@ def _leader(_args) -> int:
 
 
 def _say(args) -> int:
+    if not m.valid_token(args.channel):
+        print("error: invalid channel: must match [A-Za-z0-9._-]", file=sys.stderr)
+        return 2
     sid = f"cli-{hostname()}"
     payload = json.dumps({"text": args.text, "from": sid, "channel": args.channel})
     mid = create(
@@ -60,10 +63,13 @@ def _say(args) -> int:
 
 def _inbox(args) -> int:
     sid = args.sid or f"cli-{hostname()}"
+    if not m.valid_token(sid):
+        print("error: invalid sid: must match [A-Za-z0-9._-]", file=sys.stderr)
+        return 2
     rows = run_bd_json("query", f"assignee={sid} AND status=open") or []
     for r in rows:
         print(f"{r['id']}  {r.get('title','')}")
-        if args.ack:
+        if args.ack and m.L_DM in (r.get("labels") or []):
             run_bd("close", r["id"], actor=sid, check=False)
     return 0
 
