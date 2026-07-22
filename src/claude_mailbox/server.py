@@ -10,6 +10,7 @@ don't depend on the model remembering to call anything.
 
 from __future__ import annotations
 
+import asyncio
 import atexit
 import json
 import logging
@@ -18,8 +19,9 @@ import sys
 import threading
 import time
 
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 
+from . import channel as ch
 from . import leader as L
 from . import model as m
 from .bd import BdError, create, run_bd, run_bd_json
@@ -27,7 +29,25 @@ from .identity import GitContext, detect_git, hostname, new_sid
 
 logger = logging.getLogger("claude_mailbox")
 
-mcp = FastMCP("claude-mailbox")
+# Channels: peer messages arrive as <channel source="mailbox" ...> events pushed
+# into the session (see channel.py) — the model doesn't have to poll.
+_CHANNEL_INSTRUCTIONS = (
+    "You share a mailbox with other Claude Code sessions. Messages from peers "
+    'arrive pushed as <channel source="mailbox" kind="..." from_sid="..."> events '
+    "(kind is dm | request | delegation | broadcast). React to them: for kind="
+    '"request" answer with the respond_info tool passing the request_id attribute; '
+    "for a dm reply with send_dm to the from_sid; for a broadcast just take it into "
+    "account. Register once at session start with register_session so peers can see "
+    "you and reach you. There is a single leader (the session on the main branch); "
+    "if you are secondary, defer to it."
+)
+
+mcp = FastMCP("claude-mailbox", instructions=_CHANNEL_INSTRUCTIONS)
+ch.enable_channel(mcp)
+
+# How often the channel-delivery thread checks for new inbound to push (seconds).
+# Faster than the 30s heartbeat so peer messages feel like interrupts.
+CHANNEL_POLL_SECONDS = 4
 
 
 class _State:
@@ -37,8 +57,13 @@ class _State:
         self.bead_id: str | None = None
         self.meta: dict = {}
         self._hb_thread: threading.Thread | None = None
+        self._ch_thread: threading.Thread | None = None
+        self._seen: set[str] = set()  # message bead ids already pushed to the session
         self._stop = threading.Event()
         self._lock = threading.Lock()
+
+    def subscribed_channels(self) -> list[str]:
+        return ["general", f"{self.git.project}", "leader"]
 
 
 S = _State()
@@ -144,14 +169,104 @@ def _reap_stale() -> None:
                 L.release(reaped_sid, S.sid, check=False)
 
 
+def _channel_loop() -> None:
+    while not S._stop.wait(CHANNEL_POLL_SECONDS):
+        try:
+            _deliver_channel()
+        except Exception as exc:  # keep the daemon alive on transient bd errors
+            logger.warning("channel delivery failed: %s", exc)
+
+
+def _seed_seen() -> None:
+    """Mark all currently-present inbound + subscribed-channel messages as already
+    delivered, so the channel pushes only messages that arrive AFTER we join (no
+    startup backlog flood). The pull tools still surface any pre-existing items."""
+    for r in run_bd_json("query", f"assignee={S.sid} AND status=open") or []:
+        S._seen.add(r["id"])
+    for chan in S.subscribed_channels():
+        q = f"label={m.L_MESSAGE} AND label={m.channel_label(chan)}"
+        for r in run_bd_json("query", q) or []:
+            S._seen.add(r["id"])
+
+
+def _deliver_channel() -> None:
+    """Push new inbound to the session as claude/channel events. Delivery-once via
+    S._seen. DMs are closed after push (delivered = read); requests stay open so
+    the model can respond_info to them."""
+    if not S.bead_id or not ch.is_live():
+        return
+    # 1. items addressed to us: DMs, info-requests, delegations
+    for r in run_bd_json("query", f"assignee={S.sid} AND status=open") or []:
+        rid = r["id"]
+        if rid in S._seen:
+            continue
+        labels = r.get("labels") or []
+        try:
+            meta = json.loads(r.get("description") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            meta = {}
+        if m.L_REQUEST in labels:
+            kind = "request"
+        elif m.L_DELEGATION in labels:
+            kind = "delegation"
+        elif m.L_DM in labels:
+            kind = "dm"
+        else:
+            continue
+        text = meta.get("text") or r.get("title") or ""
+        pushed = ch.push(
+            text,
+            {
+                "kind": kind,
+                "from_sid": meta.get("from"),
+                "request_id": rid if kind == "request" else None,
+                "bead_id": rid,
+            },
+        )
+        if pushed:
+            S._seen.add(rid)
+            if kind == "dm":
+                run_bd("close", rid, actor=S.sid, check=False)
+    # 2. broadcasts on our subscribed channels (skip our own)
+    for chan in S.subscribed_channels():
+        q = f"label={m.L_MESSAGE} AND label={m.channel_label(chan)}"
+        for r in run_bd_json("query", q) or []:
+            rid = r["id"]
+            if rid in S._seen:
+                continue
+            if m.from_label(S.sid) in (r.get("labels") or []):
+                S._seen.add(rid)  # our own broadcast — don't echo it back to us
+                continue
+            try:
+                meta = json.loads(r.get("description") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                meta = {}
+            if ch.push(
+                meta.get("text") or r.get("title") or "",
+                {
+                    "kind": "broadcast",
+                    "channel": chan,
+                    "from_sid": meta.get("from"),
+                    "bead_id": rid,
+                },
+            ):
+                S._seen.add(rid)
+
+
 # ── tools ────────────────────────────────────────────────────────────────────
 @mcp.tool
-def register_session(objective: str) -> dict:
+async def register_session(objective: str, ctx: Context) -> dict:
     """Register this Claude session in the mailbox and start heartbeating.
 
     project/branch/worktree are auto-detected from git. Auto-claims leadership
-    if on the main branch. Idempotent for the process lifetime.
+    if on the main branch. Idempotent for the process lifetime. Also captures the
+    live session so peer messages can be pushed as claude/channel events.
     """
+    ch.capture(ctx)  # async tool → we're on the server loop; grabs session+loop
+    return await asyncio.to_thread(_register_impl, objective)
+
+
+def _register_impl(objective: str) -> dict:
     g = S.git = detect_git()
     if S.bead_id:  # already registered — just refresh objective
         return update_objective(objective)
@@ -206,14 +321,19 @@ def register_session(objective: str) -> dict:
             check=False,
         )
     _reap_stale()
+    _seed_seen()  # only push messages that arrive after we join
     if not S._hb_thread:
         S._hb_thread = threading.Thread(target=_hb_loop, daemon=True)
         S._hb_thread.start()
+    if not S._ch_thread and ch.is_live():
+        S._ch_thread = threading.Thread(target=_channel_loop, daemon=True)
+        S._ch_thread.start()
     return {
         "sid": S.sid,
         "bead_id": S.bead_id,
         "role": lead["role"],
         "leader": L.read_leader(S.sid),
+        "channel": "live" if ch.is_live() else "not-registered-as-channel",
     }
 
 

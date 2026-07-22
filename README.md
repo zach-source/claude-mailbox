@@ -51,6 +51,25 @@ Add to `~/.claude/mcp_servers.json` (and it mirrors to codex):
   "/Users/ztaylor/repos/workspaces/claude-mailbox", "claude-mailbox"] }
 ```
 
-Status: **MVP** — registration, presence, channels, DMs, leadership, delegation.
-Gate-based `request_info` (blocking Q&A) and nix packaging are the next steps
-(see `docs/DESIGN.md` §8–9).
+## Push delivery via Claude Code channels
+The server is also a [Claude Code **channel**](https://code.claude.com/docs/en/channels-reference):
+it declares the `claude/channel` capability and **pushes** peer messages into the
+session as `<channel source="mailbox" kind="dm|request|delegation|broadcast"
+from_sid="…">…</channel>` events — so a peer's DM or info-request *interrupts* the
+session instead of waiting for a `poll_inbox` call. A background thread
+(`CHANNEL_POLL_SECONDS`, default 4s) watches `beads_global` for new inbound
+addressed to this session (and broadcasts on subscribed channels: `general`,
+`<project>`, `leader`) and emits the notification. The existing `send_dm` /
+`respond_info` / `broadcast` tools are the reply side.
+
+**To actually receive channel pushes**, start Claude Code with the research-preview
+dev flag so it loads the mailbox as a channel (custom channels aren't allowlisted yet):
+```bash
+claude --dangerously-load-development-channels server:mailbox
+```
+Without the flag the mailbox still works fully as a normal MCP server (pull-based:
+`poll_inbox`, `read_channel`); you just don't get proactive `<channel>` interrupts.
+Channels are also gated by the org `channelsEnabled` policy on Team/Enterprise.
+
+Status: **beyond-MVP** — presence, channels, DMs, leadership+failover, delegation,
+blocking `request_info`, and channel push delivery. All committed, unit- + live-tested.

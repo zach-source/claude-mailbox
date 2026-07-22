@@ -16,6 +16,15 @@ Multiple Claude Code sessions run at once (different projects, branches, worktre
 machines). The mailbox MCP lets them see each other and cross-talk. State is backed
 by the shared `beads_global` database, so it works across projects and the fleet.
 
+## Push delivery (channels)
+When the session is started as a channel (`--dangerously-load-development-channels
+server:mailbox`), peer messages arrive **pushed** as `<channel source="mailbox"
+kind="dm|request|delegation|broadcast" from_sid="…" [request_id="…"]>…</channel>`
+events — you don't have to poll. React to them: for `kind="request"` answer with
+`respond_info` passing the `request_id`; for `kind="dm"` reply with `send_dm` to the
+`from_sid`; for `kind="broadcast"` just take it into account. Without the channel
+flag, use `poll_inbox` / `read_channel` instead (same data, pull-based).
+
 ## The one rule: a single leader on `main`
 Exactly one session is the **leader/orchestrator** — the one on the `main` branch.
 Everyone else is **secondary**. `register_session` auto-claims leadership when
