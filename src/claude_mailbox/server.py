@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import atexit
 import json
+import signal
+import sys
 import threading
 import time
 
@@ -19,7 +21,7 @@ from fastmcp import FastMCP
 
 from . import leader as L
 from . import model as m
-from .bd import create, run_bd, run_bd_json
+from .bd import BdError, create, run_bd, run_bd_json
 from .identity import GitContext, detect_git, hostname, new_sid
 
 mcp = FastMCP("claude-mailbox")
@@ -30,6 +32,7 @@ class _State:
         self.sid = new_sid()
         self.git: GitContext = detect_git()
         self.bead_id: str | None = None
+        self.meta: dict = {}
         self._hb_thread: threading.Thread | None = None
         self._stop = threading.Event()
 
@@ -69,6 +72,15 @@ def _heartbeat_once() -> dict:
     if not S.bead_id:
         return {"ok": False}
     S.git = detect_git()
+    if (
+        S.meta.get("branch") != S.git.branch
+        or S.meta.get("worktree") != S.git.worktree
+        or S.meta.get("project") != S.git.project
+    ):
+        S.meta["branch"] = S.git.branch
+        S.meta["worktree"] = S.git.worktree
+        S.meta["project"] = S.git.project
+        run_bd("update", S.bead_id, "-d", json.dumps(S.meta), actor=S.sid, check=False)
     run_bd(
         "set-state", S.bead_id, f"{m.D_HB}={m.hb_now()}", "--reason", "hb", actor=S.sid
     )
@@ -131,6 +143,7 @@ def register_session(objective: str) -> dict:
         "objective": objective,
         "machine": hostname(),
     }
+    S.meta = meta
     title = f"[session] {g.project}@{g.branch} — {objective}"[:200]
     S.bead_id = run_bd(
         "q",
@@ -202,11 +215,14 @@ def update_objective(objective: str) -> dict:
     if not S.bead_id:
         return {"ok": False, "error": "not registered"}
     g = S.git
+    S.meta["objective"] = objective
     run_bd(
         "update",
         S.bead_id,
         "--title",
         f"[session] {g.project}@{g.branch} — {objective}"[:200],
+        "-d",
+        json.dumps(S.meta),
         actor=S.sid,
     )
     run_bd("note", S.bead_id, f"objective: {objective}", actor=S.sid, check=False)
@@ -311,8 +327,11 @@ def send_dm(to_sid: str, text: str) -> dict:
         description=payload,
         actor=S.sid,
     )
-    run_bd("assign", mid, to_sid, actor=S.sid, check=False)
-    return {"message_id": mid}
+    try:
+        run_bd("assign", mid, to_sid, actor=S.sid, check=True)
+    except BdError as e:
+        return {"message_id": mid, "delivered": False, "error": str(e)}
+    return {"message_id": mid, "delivered": True}
 
 
 @mcp.tool
@@ -345,13 +364,19 @@ def poll_inbox(mark_read: bool = True) -> dict:
 
 
 def _bead_status(bead_id: str) -> str | None:
-    rows = run_bd_json("show", bead_id)
+    try:
+        rows = run_bd_json("show", bead_id)
+    except BdError:
+        return None
     bead = rows[0] if isinstance(rows, list) and rows else rows
     return bead.get("status") if isinstance(bead, dict) else None
 
 
 def _last_answer(bead_id: str) -> str | None:
-    comments = run_bd_json("comments", bead_id) or []
+    try:
+        comments = run_bd_json("comments", bead_id) or []
+    except BdError:
+        return None
     return comments[-1].get("text") if comments else None
 
 
@@ -359,8 +384,9 @@ def _last_answer(bead_id: str) -> str | None:
 def request_info(to_sid: str, question: str, timeout_s: int = 60) -> dict:
     """Ask another session a question and block (up to timeout_s) for its answer.
 
-    Creates a request bead assigned to the target (surfaces in their poll_inbox);
-    they reply via respond_info, which comments the answer and closes the bead.
+    Creates a request bead (not ephemeral — an unanswered question must not
+    evaporate) assigned to the target (surfaces in their poll_inbox); they
+    reply via respond_info, which comments the answer and closes the bead.
     Returns {request_id, answer, resolved, timed_out}. If it times out, keep the
     request_id and poll later with check_request — the request stays open.
     """
@@ -369,11 +395,14 @@ def request_info(to_sid: str, question: str, timeout_s: int = 60) -> dict:
         f"[req] to {to_sid}: {question}"[:200],
         type="task",
         labels=[m.L_REQUEST, m.from_label(S.sid)],
-        ephemeral=True,
+        ephemeral=False,
         description=payload,
         actor=S.sid,
     )
-    run_bd("assign", rid, to_sid, actor=S.sid, check=False)
+    try:
+        run_bd("assign", rid, to_sid, actor=S.sid, check=True)
+    except BdError as e:
+        return {"request_id": rid, "resolved": False, "error": f"assign failed: {e}"}
     deadline = time.time() + max(0, timeout_s)
     while time.time() < deadline:
         time.sleep(3)
@@ -399,7 +428,10 @@ def respond_info(request_id: str, answer: str) -> dict:
 @mcp.tool
 def check_request(request_id: str) -> dict:
     """Non-blocking: has an info-request been answered yet?"""
-    resolved = _bead_status(request_id) == "closed"
+    status = _bead_status(request_id)
+    if status is None:
+        return {"resolved": False, "answer": None, "gone": True}
+    resolved = status == "closed"
     return {
         "resolved": resolved,
         "answer": _last_answer(request_id) if resolved else None,
@@ -457,7 +489,14 @@ def _deregister() -> dict:
 atexit.register(_deregister)
 
 
+def _sig(_signum, _frame):
+    _deregister()
+    sys.exit(0)
+
+
 def main() -> None:
+    signal.signal(signal.SIGTERM, _sig)
+    signal.signal(signal.SIGINT, _sig)
     mcp.run()
 
 

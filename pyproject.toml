@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "MCP mailbox for cross-talk between concurrent Claude Code sessions, backed by beads (bd)"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["fastmcp>=2.0"]
+dependencies = ["fastmcp>=3"]
 
 [project.scripts]
 claude-mailbox = "claude_mailbox.server:main"

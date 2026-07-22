@@ -3,8 +3,12 @@
 Invariant: at most one leader; the session on `main` wins. The slot bead's
 state dimensions (leader / leader-branch / leader-hb) are the source of truth —
 `bd set-state` is atomic and event-backed, so a losing racer is always
-detectable on read-back. Tiebreak on simultaneous claims: lexicographically
-smallest sid wins.
+detectable on read-back. Tiebreak on simultaneous claims: `claim` runs a
+bounded convergent loop on the smallest-sid rule — a contending sid keeps
+rewriting itself as leader until it reads back its own sid with no smaller sid
+contesting, while any larger sid yields as soon as it observes a smaller
+holder. This way every racer converges on the same holder without a
+coordinator.
 """
 
 from __future__ import annotations
@@ -13,9 +17,6 @@ import time
 
 from . import model as m
 from .bd import run_bd, run_bd_json
-
-# Stable identity for the singleton slot so concurrent first-use converges.
-_SLOT_REF = "mailbox-leader-slot"
 
 
 def _labels(bead: dict) -> list[str]:
@@ -35,27 +36,42 @@ def states_of(bead: dict) -> dict[str, str]:
 
 
 def _find_slot() -> dict | None:
+    """Return the slot bead with the lexicographically smallest id (deterministic
+    even when multiple slot beads exist), or None if there is no slot yet."""
     rows = run_bd_json("query", f"label={m.L_LEADER_SLOT}") or []
-    return rows[0] if rows else None
+    return min(rows, key=lambda r: r["id"]) if rows else None
 
 
 def ensure_slot(actor: str) -> str:
-    """Return the slot bead id, creating it if absent."""
+    """Return the slot bead id, creating it if absent. Self-heals a create-race
+    by keeping the min-id slot and closing any duplicates."""
     slot = _find_slot()
-    if slot:
-        return slot["id"]
-    bid = run_bd(
-        "q",
-        "[mailbox] leader-slot",
-        "-t",
-        "task",
-        "-l",
-        m.L_LEADER_SLOT,
-        actor=actor,
-    ).strip()
-    run_bd(
-        "set-state", bid, f"{m.D_LEADER}=vacant", "--reason", "slot init", actor=actor
-    )
+    if not slot:
+        run_bd(
+            "q",
+            "[mailbox] leader-slot",
+            "-t",
+            "task",
+            "-l",
+            m.L_LEADER_SLOT,
+            actor=actor,
+        ).strip()
+    rows = run_bd_json("query", f"label={m.L_LEADER_SLOT}") or []
+    if not rows:
+        raise RuntimeError("failed to create leader-slot bead")
+    bid = min(r["id"] for r in rows)
+    for r in rows:
+        if r["id"] != bid:
+            run_bd("close", r["id"], actor=actor, check=False)
+    if not slot:
+        run_bd(
+            "set-state",
+            bid,
+            f"{m.D_LEADER}=vacant",
+            "--reason",
+            "slot init",
+            actor=actor,
+        )
     return bid
 
 
@@ -78,34 +94,41 @@ def read_leader(actor: str) -> dict:
 
 
 def claim(sid: str, branch: str, actor: str, force: bool = False) -> dict:
-    """Try to become leader. Only main-branch sessions claim (unless force)."""
+    """Try to become leader. Only main-branch sessions claim (unless force).
+
+    Runs a bounded convergent loop on the smallest-sid rule: a racer keeps
+    rewriting itself as leader until it reads back its own sid with no
+    smaller sid contesting, while a larger sid yields as soon as it sees a
+    smaller (or equally legitimate) holder. Concurrently, every racer
+    deterministically agrees on the same holder.
+    """
     if branch != m.LEADER_BRANCH and not force:
         return {"granted": False, "reason": f"not on {m.LEADER_BRANCH}"}
 
     bid = ensure_slot(actor)
-    cur = read_leader(actor)
-    if not cur["vacant"] and not cur["stale"] and not force:
-        if cur["leader_sid"] == sid:
-            _refresh(bid, sid, branch, actor)
-            return {"granted": True, "reason": "already leader"}
+    for _ in range(6):  # bounded convergence
+        cur = read_leader(actor)
+        holder = None if cur["vacant"] or cur["stale"] else cur["leader_sid"]
+        if holder == sid:
+            _refresh(bid, sid, branch, actor)  # I hold it; keep hb fresh
+            return {"granted": True, "reason": "leader"}
+        if holder is None or force or sid < holder:  # vacant/stale, or I have priority
+            _write_leader(bid, sid, branch, actor, reason="claim")
+            time.sleep(1.0)  # settle for Dolt visibility
+            continue
         return {
             "granted": False,
-            "reason": "leader active",
-            "current_leader": cur["leader_sid"],
-        }
-
-    # Claim, then settle + read back for split-brain detection.
-    _write_leader(bid, sid, branch, actor, reason="claim")
-    time.sleep(1.0)
-    after = read_leader(actor)
-    winner = after["leader_sid"]
-    if winner and winner != sid:
-        # Someone else's write landed after ours. Smallest-sid tiebreak.
-        if sid < winner:
-            _write_leader(bid, sid, branch, actor, reason="tiebreak-win")
-            return {"granted": True, "reason": "won tiebreak"}
-        return {"granted": False, "reason": "lost tiebreak", "current_leader": winner}
-    return {"granted": True, "reason": "claimed"}
+            "reason": "yielded",
+            "current_leader": holder,
+        }  # holder has priority
+    # didn't converge in the loop budget: last read decides
+    cur = read_leader(actor)
+    granted = (not cur["vacant"]) and cur["leader_sid"] == sid
+    return {
+        "granted": granted,
+        "reason": "settled",
+        "current_leader": cur.get("leader_sid"),
+    }
 
 
 def _write_leader(bid: str, sid: str, branch: str, actor: str, reason: str):
