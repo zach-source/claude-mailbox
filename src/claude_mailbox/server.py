@@ -129,6 +129,19 @@ def _reap_stale() -> None:
                 check=False,
             )
             run_bd("close", row["id"], actor=S.sid, check=False)
+            reaped_sid = next(
+                (
+                    lbl.removeprefix("session:")
+                    for lbl in (row.get("labels") or [])
+                    if lbl.startswith("session:")
+                ),
+                None,
+            )
+            if reaped_sid and L.read_leader(S.sid).get("leader_sid") == reaped_sid:
+                # The reaped session was still holding the leader slot — vacate it
+                # so a live session can fail over instead of waiting for the next
+                # main-branch heartbeat to notice staleness.
+                L.release(reaped_sid, S.sid, check=False)
 
 
 # ── tools ────────────────────────────────────────────────────────────────────
@@ -206,14 +219,13 @@ def register_session(objective: str) -> dict:
 
 @mcp.tool
 def heartbeat() -> dict:
-    """Manually pump a heartbeat and return role + inbox count (the background
-    thread does this automatically; call it to force a fresh read)."""
+    """Manually pump a heartbeat and return role + inbox (the background
+    thread heartbeats automatically; call it to force a fresh read)."""
     r = _heartbeat_once()
-    inbox = poll_inbox(mark_read=False)
     return {
         **r,
         "leader": L.read_leader(S.sid),
-        "inbox_count": sum(len(v) for v in inbox.values() if isinstance(v, list)),
+        "inbox": poll_inbox(mark_read=False),
     }
 
 
@@ -465,6 +477,8 @@ def delegate(to_sid: str, title: str, detail: str = "", priority: int = 2) -> di
     """Leader-only: assign a work item to a secondary session."""
     if not m.valid_token(to_sid):
         return {"ok": False, "error": "invalid to_sid: must match [A-Za-z0-9._-]"}
+    # Re-read the leader slot on every call (not cached) to guard against a stale
+    # leadership belief — e.g. this session lost leadership since it last checked.
     lead = L.read_leader(S.sid)
     if lead.get("leader_sid") != S.sid:
         return {"ok": False, "error": "not the leader"}

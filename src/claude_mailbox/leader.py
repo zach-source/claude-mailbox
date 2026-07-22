@@ -25,6 +25,8 @@ def _labels(bead: dict) -> list[str]:
 
 def states_of(bead: dict) -> dict[str, str]:
     """Extract state dimensions from a bead's `dimension:value` labels."""
+    # Only these known dimensions are surfaced — a new `set-state` dimension
+    # won't appear here until it's added to `known`.
     known = {m.D_STATUS, m.D_ROLE, m.D_HB, m.D_LEADER, m.D_LEADER_BRANCH, m.D_LEADER_HB}
     out: dict[str, str] = {}
     for lbl in _labels(bead):
@@ -178,7 +180,7 @@ def heartbeat_leader(sid: str, branch: str, actor: str) -> dict:
     return {"role": "secondary", **cur}
 
 
-def release(sid: str, actor: str) -> dict:
+def release(sid: str, actor: str, check: bool = True) -> dict:
     slot = _find_slot()
     if not slot:
         return {"ok": True}
@@ -191,5 +193,6 @@ def release(sid: str, actor: str) -> dict:
             "--reason",
             "release",
             actor=actor,
+            check=check,
         )
     return {"ok": True}

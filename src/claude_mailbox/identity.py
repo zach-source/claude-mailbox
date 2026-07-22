@@ -27,7 +27,7 @@ def _git(*args: str, cwd: str) -> str | None:
 @dataclass(frozen=True)
 class GitContext:
     project: str  # repo name (basename of toplevel)
-    branch: str  # current branch (or "DETACHED")
+    branch: str  # current branch (or "detached")
     worktree: str  # absolute worktree path (or cwd if not a repo)
 
 
@@ -36,9 +36,11 @@ def detect_git(cwd: str | None = None) -> GitContext:
     top = _git("rev-parse", "--show-toplevel", cwd=cwd)
     if not top:
         return GitContext(
-            project=os.path.basename(cwd) or "unknown", branch="none", worktree=cwd
+            project=os.path.basename(cwd) or "unknown",
+            branch="no-branch",
+            worktree=cwd,
         )
-    branch = _git("rev-parse", "--abbrev-ref", "HEAD", cwd=cwd) or "DETACHED"
+    branch = _git("rev-parse", "--abbrev-ref", "HEAD", cwd=cwd) or "detached"
     return GitContext(project=os.path.basename(top), branch=branch, worktree=top)
 
 

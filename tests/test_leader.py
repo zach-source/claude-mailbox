@@ -135,6 +135,24 @@ def test_two_actor_convergence(store):
     assert out_large["current_leader"] == "h-1-aaa"
 
 
+def test_release_vacates_only_when_sid_is_current_leader(store):
+    """Drives the leader-vacate helper server._reap_stale relies on: releasing a
+    sid that isn't the current leader is a no-op, but releasing the actual
+    leader sid vacates the slot. (server._reap_stale itself imports FastMCP, so
+    it's exercised indirectly here by covering the L.release(check=False) path
+    it calls after reaping a stale leader's session bead.)"""
+    L.claim("h-1-aaa", branch="main", actor="h-1-aaa")
+    assert L.read_leader("h-1-aaa")["leader_sid"] == "h-1-aaa"
+
+    # Releasing a non-leader sid (e.g. some other reaped session) is a no-op.
+    L.release("h-1-zzz", "h-1-zzz", check=False)
+    assert L.read_leader("h-1-aaa")["leader_sid"] == "h-1-aaa"
+
+    # Releasing the reaped leader's own sid vacates the slot.
+    L.release("h-1-aaa", "h-1-aaa", check=False)
+    assert L.read_leader("h-1-aaa")["vacant"] is True
+
+
 def test_slot_dedup(store):
     """Pre-seed two slot beads; ensure_slot converges to the min-id one and
     closes the extra."""
