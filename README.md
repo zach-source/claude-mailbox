@@ -48,7 +48,7 @@ bd init --global               # creates/initializes beads_global on the shared 
 Add to `~/.claude/mcp_servers.json` (and it mirrors to codex):
 ```json
 "mailbox": { "command": "uv", "args": ["run", "--project",
-  "/Users/ztaylor/repos/workspaces/claude-mailbox", "claude-mailbox"] }
+  "/path/to/claude-mailbox", "claude-mailbox"] }
 ```
 
 ## Push delivery via Claude Code channels
