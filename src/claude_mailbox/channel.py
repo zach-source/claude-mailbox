@@ -19,28 +19,26 @@ Note: during the research preview custom channels aren't allowlisted, so a sessi
 must be started with `--dangerously-load-development-channels server:mailbox` (and
 the org's `channelsEnabled` policy must allow it) for these pushes to register.
 
-HTTP-mode caveat: `_ChannelState` is a single process-global slot — `capture()`
-keeps only the *first* session it ever sees for the life of the process; later
-connections never overwrite it. FastMCP's streamable-HTTP transport *does* give
-each connection its own `ServerSession` (keyed by the `mcp-session-id` header;
-see `Context.session_id` in fastmcp's `server/context.py`), so a per-connection
-capture table keyed by that id is technically possible. It isn't done here
-because the rest of this server's per-session state (`_State` in server.py —
-sid, bead_id, objective) is *also* one process-global instance, not
-connection-scoped; fixing channel push alone would still leave every other tool
-call on an HTTP server sharing one identity across connections. That's a
-larger redesign than this fix. Until then: channel push in HTTP mode is
-best-effort and single-client only — only the first connection to call a tool
-that captures a session (e.g. `register_session`) will ever receive pushes.
-Don't build on push reaching a specific caller in HTTP mode with more than one
-concurrent client. Stdio mode (one process per session) is unaffected.
+Per-connection push: `capture()` returns a `ChannelState` scoped to the calling
+connection (server.py stores one on its per-connection `_SessionState`, keyed by
+`Context.session_id`) instead of mutating a single process-global slot. Each
+connection's push therefore goes to that connection's own session, so a
+multi-client HTTP-mode server delivers to every connection, not just the first
+one to register — this resolves the single-client limitation this module used
+to document here. Residual limitation: if a connection dies without ever
+calling `deregister`, its captured `ChannelState` (and the write it would need
+to detect that) isn't cleaned up by this module — that's handled by server.py's
+idle-connection reap in `_hb_tick_once`, which is time-based (no client tool
+call for a while) rather than a true liveness probe, since neither this module
+nor server.py peeks at the underlying transport's connection state. See
+server.py's `_hb_tick_once` docstring and the README/DESIGN docs for that
+tradeoff.
 """
 
 from __future__ import annotations
 
 import asyncio
 import re
-import threading
 
 from mcp.shared.session import SessionMessage
 from mcp.types import JSONRPCMessage, JSONRPCNotification
@@ -52,21 +50,25 @@ CHANNEL_METHOD = "notifications/claude/channel"
 # are silently dropped by Claude Code. We sanitize keys and stringify values.
 _KEY_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
+_ENABLED = (
+    False  # capability declared on the server — process-global, not per-connection
+)
 
-class _ChannelState:
+
+class ChannelState:
+    """One connection's captured live session + loop. Owned by the caller
+    (server.py keeps one per `_SessionState`) — this module no longer holds any
+    per-connection state itself."""
+
     def __init__(self) -> None:
-        self.session = None  # mcp ServerSession, captured on first tool call
+        self.session = None
         self.loop: asyncio.AbstractEventLoop | None = None
-        self.enabled = False  # capability declared on this server
-        self._lock = threading.Lock()
-
-
-_CH = _ChannelState()
 
 
 def enable_channel(mcp) -> None:
     """Declare the `claude/channel` capability on a FastMCP server by wrapping the
     low-level server's create_initialization_options to inject it. Idempotent."""
+    global _ENABLED
     low = mcp._mcp_server
     orig = low.create_initialization_options
 
@@ -76,7 +78,7 @@ def enable_channel(mcp) -> None:
         return orig(notification_options, caps, **kw)
 
     low.create_initialization_options = patched
-    _CH.enabled = True
+    _ENABLED = True
 
 
 def _unwrap_session(obj):
@@ -92,31 +94,35 @@ def _unwrap_session(obj):
     return None
 
 
-def capture(ctx) -> None:
-    """Capture the live ServerSession + running loop from an async tool's Context
-    so the background poller can push notifications. MUST be called from an async
-    tool (so `asyncio.get_running_loop()` returns the server loop). Best-effort —
-    never raises into the tool; only the first successful capture matters."""
-    if _CH.session is not None:
-        return
+def capture(ctx) -> ChannelState | None:
+    """Capture the live ServerSession + running loop for THIS connection from an
+    async tool's Context, so the background poller can push notifications to it.
+    MUST be called from an async tool (so `asyncio.get_running_loop()` returns
+    the server loop). Best-effort — never raises into the tool; returns None if
+    capture isn't possible (e.g. called from a sync tool's worker thread)."""
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        return  # not on the event loop (sync tool worker thread) — cannot capture
+        return None  # not on the event loop (sync tool worker thread) — cannot capture
     rc = getattr(ctx, "request_context", None)
     raw = _unwrap_session(getattr(rc, "session", None)) or _unwrap_session(
         getattr(ctx, "session", None)
     )
     if raw is None:
-        return
-    with _CH._lock:
-        if _CH.session is None:
-            _CH.session = raw
-            _CH.loop = loop
+        return None
+    state = ChannelState()
+    state.session = raw
+    state.loop = loop
+    return state
 
 
-def is_live() -> bool:
-    return _CH.enabled and _CH.session is not None and _CH.loop is not None
+def is_live(state: ChannelState | None) -> bool:
+    return (
+        _ENABLED
+        and state is not None
+        and state.session is not None
+        and state.loop is not None
+    )
 
 
 def _sanitize_meta(meta: dict) -> dict:
@@ -129,11 +135,12 @@ def _sanitize_meta(meta: dict) -> dict:
     return out
 
 
-def push(content: str, meta: dict | None = None) -> bool:
-    """Emit a `notifications/claude/channel` event into the captured session from
-    any thread. Returns True if the send was scheduled, False if no live session
-    (e.g. the client isn't running us as a channel). Never raises."""
-    if not is_live():
+def push(state: ChannelState | None, content: str, meta: dict | None = None) -> bool:
+    """Emit a `notifications/claude/channel` event into the given connection's
+    captured session from any thread. Returns True if the send was scheduled,
+    False if no live session for that connection (e.g. the client isn't running
+    us as a channel). Never raises."""
+    if not is_live(state):
         return False
     note = JSONRPCNotification(
         jsonrpc="2.0",
@@ -144,12 +151,12 @@ def push(content: str, meta: dict | None = None) -> bool:
 
     async def _send():
         try:
-            await _CH.session._write_stream.send(msg)
+            await state.session._write_stream.send(msg)
         except Exception:
             pass  # session torn down / not a channel — drop silently, like the spec
 
     try:
-        asyncio.run_coroutine_threadsafe(_send(), _CH.loop)
+        asyncio.run_coroutine_threadsafe(_send(), state.loop)
         return True
     except Exception:
         return False
