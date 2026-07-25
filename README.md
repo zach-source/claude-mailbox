@@ -93,6 +93,51 @@ never to any connection after that. See the docstring in `channel.py` for why.
 Pull-based tools (`poll_inbox`, `read_channel`) work correctly for every
 caller regardless.
 
+## Docker
+A published image runs the server in HTTP mode with its own local database out
+of the box (`MAILBOX_TRANSPORT=http`, `MAILBOX_GLOBAL=0` are baked in as
+defaults — override via `-e` if you need something else). Images are built by
+`.github/workflows/docker-publish.yml` for `linux/amd64` and `linux/arm64` and
+published to GHCR:
+
+```bash
+docker pull ghcr.io/<owner>/claude-mailbox:latest   # latest tagged release
+docker pull ghcr.io/<owner>/claude-mailbox:edge     # latest main
+```
+
+`/data` is `MAILBOX_WORKSPACE` (and `$HOME`) inside the container — mount a
+volume there for the local database to survive restarts, and initialize it
+once before the first start (bd needs `git init` to succeed, which needs an
+already-writable, already-owned directory — the named volume gets that from
+the image's `useradd --create-home` on first use):
+
+```bash
+docker volume create mailbox-data
+docker run --rm -v mailbox-data:/data --user mailbox \
+  --entrypoint bd ghcr.io/<owner>/claude-mailbox:latest init --non-interactive
+
+docker run -d --name claude-mailbox -p 8000:8000 \
+  -v mailbox-data:/data ghcr.io/<owner>/claude-mailbox:latest
+```
+
+Then wire it into a Claude Code session elsewhere as an `http`-type MCP server
+entry pointing at `http://<host>:8000/mcp` (see "HTTP mode" above for the
+non-Docker equivalent and the channel-push caveat, which applies here too).
+
+**Build notes (low-CVE build):** multi-stage — build tooling never reaches the
+final image, which installs only `git` + `ca-certificates` on top of the
+official `python:3.11-slim` base (distroless was evaluated and rejected: `bd`
+hard-shells out to `git`, which needs a shell environment distroless doesn't
+provide) and runs as a non-root user. The `bd` binary is fetched as a pinned,
+checksum-verified release tarball rather than trusted implicitly. CI scans
+every build with Trivy and uploads results to the repo's Security tab
+(report-only — see the Dockerfile header for the residual CVE clusters this
+repo can't fully resolve on its own, and why) and rebuilds weekly so upstream
+Debian/Python security patches land automatically. Build it yourself with:
+```bash
+docker build -t claude-mailbox .
+```
+
 ## Push delivery via Claude Code channels
 The server is also a [Claude Code **channel**](https://code.claude.com/docs/en/channels-reference):
 it declares the `claude/channel` capability and **pushes** peer messages into the
