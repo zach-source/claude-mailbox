@@ -1,10 +1,17 @@
 """Thin, typed wrapper around the `bd` (beads) CLI.
 
-All mailbox state lives in the shared machine-wide `beads_global` Dolt database.
-`bd --global` routes there, but bd still needs a *workspace* (a local `.beads/`)
-to resolve the shared-server connection — so every call passes `-C WORKSPACE`,
-pointing at this repo's own `.beads/`. That keeps the mailbox reachable no matter
-which project directory the Claude session is actually running in.
+By default (`MAILBOX_GLOBAL` unset or truthy) all mailbox state lives in the
+shared machine-wide `beads_global` Dolt database: `bd --global` routes there,
+but bd still needs a *workspace* (a local `.beads/`) to resolve the
+shared-server connection — so every call passes `-C WORKSPACE`, pointing at
+this repo's own `.beads/`. That keeps the mailbox reachable no matter which
+project directory the Claude session is actually running in.
+
+Set `MAILBOX_GLOBAL=0` (or `false`/`no`) to omit `--global` entirely, so `bd`
+resolves against a plain local project database under WORKSPACE via its
+default embedded engine instead — the mode used when this server runs as a
+standalone HTTP service with its own dedicated local database (see
+MAILBOX_TRANSPORT in server.py and the README's HTTP mode section).
 """
 
 from __future__ import annotations
@@ -28,12 +35,29 @@ class BdError(RuntimeError):
     """A `bd` invocation exited non-zero."""
 
 
+def use_global() -> bool:
+    """Whether to pass `--global` (routes to the shared beads_global DB).
+
+    Controlled by MAILBOX_GLOBAL, default true (current/stdio behavior).
+    Set to "0"/"false"/"no" to resolve against a plain local project DB
+    under WORKSPACE instead (standalone HTTP mode with its own database).
+    """
+    return os.environ.get("MAILBOX_GLOBAL", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+
+
 def run_bd(*args: str, actor: str | None = None, check: bool = True) -> str:
-    """Run `bd --global -C WORKSPACE [--actor A] <args>` and return stdout.
+    """Run `bd [--global] -C WORKSPACE [--actor A] <args>` and return stdout.
 
     Raises BdError on non-zero exit (unless check=False, which returns "").
     """
-    cmd = [BD, "--global", "-C", WORKSPACE]
+    cmd = [BD]
+    if use_global():
+        cmd += ["--global"]
+    cmd += ["-C", WORKSPACE]
     if actor:
         cmd += ["--actor", actor]
     cmd += list(args)

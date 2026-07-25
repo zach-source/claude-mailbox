@@ -51,6 +51,48 @@ Add to `~/.claude/mcp_servers.json` (and it mirrors to codex):
   "/path/to/claude-mailbox", "claude-mailbox"] }
 ```
 
+## HTTP mode (standalone service, local database)
+By default the server runs over **stdio**, one process per Claude Code session,
+sharing the machine-wide `beads_global` database — this is unchanged. Set
+`MAILBOX_TRANSPORT=http` to instead run it as a standalone network service, for
+example hosting one authoritative instance in a remote pod that a Claude Code
+session on a different machine reaches as an `http`-type MCP server entry, or
+that a plain Python daemon (not a Claude session) calls directly as an MCP
+client. This mode is meant to be paired with `MAILBOX_GLOBAL=0` so the pod gets
+its own dedicated **local** database instead of the shared machine-wide one.
+
+Environment variables:
+
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `MAILBOX_TRANSPORT` | `stdio` | `stdio` (unchanged default) or `http` |
+| `MAILBOX_HTTP_HOST` | `127.0.0.1` | Bind host when `MAILBOX_TRANSPORT=http` |
+| `MAILBOX_HTTP_PORT` | `8000` | Bind port when `MAILBOX_TRANSPORT=http` |
+| `MAILBOX_GLOBAL` | `1` (true) | `1`/`true` (default) passes `--global`, routing `bd` at the shared `beads_global` DB — today's behavior. `0`/`false`/`no` omits `--global` entirely, so `bd` resolves a plain local project database under `WORKSPACE` via its default embedded engine (`bd init` with no `--server`/`--external`/`--shared-server`) |
+
+Run it as a standalone HTTP service backed by its own local database:
+```bash
+cd /path/to/claude-mailbox     # WORKSPACE — where the local .beads/ will live
+bd init --non-interactive      # one-time: creates the local embedded db
+MAILBOX_TRANSPORT=http MAILBOX_HTTP_HOST=0.0.0.0 MAILBOX_HTTP_PORT=8000 \
+  MAILBOX_GLOBAL=0 uv run claude-mailbox
+```
+Then add it to a Claude Code session on another machine as an `http`-type MCP
+server entry pointing at `http://<pod-host>:8000/mcp`, or point any MCP-capable
+HTTP client (including a non-Claude Python daemon) at the same URL.
+
+Note: on a machine that already sets `BEADS_DOLT_SHARED_SERVER=1` globally
+(a machine-wide `bd` default, independent of this server), `MAILBOX_GLOBAL=0`
+still resolves through that shared server unless the pod environment leaves
+`BEADS_DOLT_SHARED_SERVER` unset — the pod deployment should simply not set it.
+
+**Channel push limitation in HTTP mode:** proactive `<channel>` push (see
+below) is best-effort and **single-client only** in HTTP mode — it delivers to
+whichever connection first captures a session in the server process, and
+never to any connection after that. See the docstring in `channel.py` for why.
+Pull-based tools (`poll_inbox`, `read_channel`) work correctly for every
+caller regardless.
+
 ## Push delivery via Claude Code channels
 The server is also a [Claude Code **channel**](https://code.claude.com/docs/en/channels-reference):
 it declares the `claude/channel` capability and **pushes** peer messages into the

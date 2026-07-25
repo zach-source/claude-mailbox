@@ -18,6 +18,22 @@ Mechanics (grounded in the installed MCP SDK):
 Note: during the research preview custom channels aren't allowlisted, so a session
 must be started with `--dangerously-load-development-channels server:mailbox` (and
 the org's `channelsEnabled` policy must allow it) for these pushes to register.
+
+HTTP-mode caveat: `_ChannelState` is a single process-global slot — `capture()`
+keeps only the *first* session it ever sees for the life of the process; later
+connections never overwrite it. FastMCP's streamable-HTTP transport *does* give
+each connection its own `ServerSession` (keyed by the `mcp-session-id` header;
+see `Context.session_id` in fastmcp's `server/context.py`), so a per-connection
+capture table keyed by that id is technically possible. It isn't done here
+because the rest of this server's per-session state (`_State` in server.py —
+sid, bead_id, objective) is *also* one process-global instance, not
+connection-scoped; fixing channel push alone would still leave every other tool
+call on an HTTP server sharing one identity across connections. That's a
+larger redesign than this fix. Until then: channel push in HTTP mode is
+best-effort and single-client only — only the first connection to call a tool
+that captures a session (e.g. `register_session`) will ever receive pushes.
+Don't build on push reaching a specific caller in HTTP mode with more than one
+concurrent client. Stdio mode (one process per session) is unaffected.
 """
 
 from __future__ import annotations
