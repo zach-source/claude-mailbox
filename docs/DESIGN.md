@@ -49,6 +49,16 @@ Python + FastMCP (thin subprocess wrapper; simple background heartbeat thread;
 covered by the repo `mcp-builder` skill). Server shells out to `bd`, never to
 Dolt directly.
 
+Session identity is per-connection (`_SessionState`, keyed by FastMCP's
+`Context.session_id`), not per-process. Under stdio there's exactly one
+connection for the process's life, so this is unchanged from a single
+in-memory instance; under `MAILBOX_TRANSPORT=http` a single process can serve
+several concurrent connections, each with its own sid/git-context/bead_id/
+objective/captured channel session. One shared heartbeat thread and one shared
+channel-delivery thread iterate every tracked connection each tick — not one
+thread pair per connection — since a periodic sweep over a dict is simpler
+than per-connection thread lifecycle management and equally correct.
+
 ## bd integration notes (verified — differ from the first-draft design)
 1. **`bd --global` needs a local `.beads/` workspace** for the shared-server
    connection config. The server always passes `-C <mailbox-repo>` (see `bd.py`)
@@ -64,6 +74,14 @@ Dolt directly.
    slow readers, switch broadcasts to `--defer`-based expiry.
 
 ## 9. Risks / open questions
+- **HTTP-mode idle-connection reap is time-based, not a transport liveness
+  check**: a connection that disconnects without calling `deregister` is only
+  noticed once it's gone `_CONN_IDLE_SECONDS` (reuses the existing 10×-stale
+  threshold, 900s) without a tool call — there's no probe of the underlying
+  socket/stream. A connection that stays open but is genuinely idle that long
+  is indistinguishable from an abandoned one and gets reaped too. Gated to
+  `MAILBOX_TRANSPORT=http` only, so stdio's single long-lived connection is
+  never affected.
 - **set-state race semantics** on the shared Dolt server drive the claim/read-back
   tiebreak; verify empirically under two simultaneous main sessions.
 - **Fleet sync is pull-based** (`bd dolt push/pull`): cross-machine visibility &

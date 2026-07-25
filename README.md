@@ -86,12 +86,18 @@ Note: on a machine that already sets `BEADS_DOLT_SHARED_SERVER=1` globally
 still resolves through that shared server unless the pod environment leaves
 `BEADS_DOLT_SHARED_SERVER` unset — the pod deployment should simply not set it.
 
-**Channel push limitation in HTTP mode:** proactive `<channel>` push (see
-below) is best-effort and **single-client only** in HTTP mode — it delivers to
-whichever connection first captures a session in the server process, and
-never to any connection after that. See the docstring in `channel.py` for why.
-Pull-based tools (`poll_inbox`, `read_channel`) work correctly for every
-caller regardless.
+**Per-connection session isolation:** one HTTP-mode process can serve many
+concurrent connections, and each gets its own sid/git-context/bead_id/
+objective, keyed off FastMCP's `Context.session_id` (the `mcp-session-id`
+header) — they never collide, and proactive `<channel>` push (see below)
+delivers to every connection, not just the first one to register. Residual
+limitation: cleanup of a connection that disconnects without calling
+`deregister` is time-based (idle for 15 minutes with no tool call), not a true
+liveness check against the underlying transport — a connection that stays
+open but genuinely idle that long gets treated as abandoned. See
+`server.py`'s `_hb_tick_once` docstring for the tradeoff. Stdio mode (one
+process per session) is unaffected either way — idle reap only ever applies
+under `MAILBOX_TRANSPORT=http`.
 
 ## Docker
 A published image runs the server in HTTP mode with its own local database out
@@ -122,7 +128,8 @@ docker run -d --name claude-mailbox -p 8000:8000 \
 
 Then wire it into a Claude Code session elsewhere as an `http`-type MCP server
 entry pointing at `http://<host>:8000/mcp` (see "HTTP mode" above for the
-non-Docker equivalent and the channel-push caveat, which applies here too).
+non-Docker equivalent and the per-connection isolation notes, which apply
+here too).
 
 **Build notes (low-CVE build):** multi-stage — build tooling never reaches the
 final image, which installs only `git` + `ca-certificates` on top of the

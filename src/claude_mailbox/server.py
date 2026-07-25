@@ -6,6 +6,10 @@ lives in the shared `beads_global` Dolt DB via the `bd` CLI (see bd.py).
 
 A background thread heartbeats every HB_BUCKET seconds so liveness/leadership
 don't depend on the model remembering to call anything.
+
+Session identity is per-connection, not per-process (see `_SessionState` /
+`_SESSIONS` below) — a single HTTP-mode server process can serve multiple
+concurrent Claude Code connections, each with its own sid/git-context/bead_id.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ import threading
 import time
 
 from fastmcp import Context, FastMCP
+from fastmcp.server.dependencies import get_context
 
 from . import channel as ch
 from . import leader as L
@@ -51,23 +56,77 @@ ch.enable_channel(mcp)
 CHANNEL_POLL_SECONDS = 4
 
 
-class _State:
-    def __init__(self) -> None:
+class _SessionState:
+    """Per-connection session identity: everything that used to live on the
+    single module-global `_State` singleton, now scoped to one caller."""
+
+    def __init__(self, conn_id: str) -> None:
+        self.conn_id = conn_id
         self.sid = new_sid()
         self.git: GitContext = detect_git()
         self.bead_id: str | None = None
         self.meta: dict = {}
-        self._hb_thread: threading.Thread | None = None
-        self._ch_thread: threading.Thread | None = None
-        self._seen: set[str] = set()  # message bead ids already pushed to the session
-        self._stop = threading.Event()
+        self.channel: ch.ChannelState | None = None  # captured per-connection
+        self._seen: set[str] = (
+            set()
+        )  # message bead ids already pushed to this connection
         self._lock = threading.Lock()
+        self.last_activity = time.time()  # last real tool call from this connection
 
     def subscribed_channels(self) -> list[str]:
         return ["general", f"{self.git.project}", "leader"]
 
 
-S = _State()
+# ── per-connection session registry ─────────────────────────────────────────
+# Keyed by fastmcp's Context.session_id, which is stable for the life of one
+# connection on every transport: for HTTP it's the `mcp-session-id` header; for
+# stdio/SSE/in-memory, fastmcp generates a UUID once and caches it on the
+# ServerSession object, so a stdio process (one connection for its whole life)
+# still gets exactly one entry here — identical to the old single-singleton
+# behavior. `_DEFAULT_CONN_ID` is only a fallback for the rare case there's no
+# active MCP context at all (e.g. unit tests calling tool functions directly as
+# plain Python calls); it reproduces the pre-fix shared-singleton behavior those
+# tests already rely on.
+_DEFAULT_CONN_ID = "default"
+_SESSIONS: dict[str, _SessionState] = {}
+_SESSIONS_LOCK = threading.Lock()
+
+# How long an HTTP-mode connection can go without a real tool call before we
+# treat it as abandoned (see _hb_tick_once). Reuses the exact reap threshold
+# `_reap_stale` already uses for cross-process crash cleanup.
+_CONN_IDLE_SECONDS = m.STALE_SECONDS * 10
+
+_hb_thread: threading.Thread | None = None
+_ch_thread: threading.Thread | None = None
+_threads_lock = threading.Lock()
+_stop = threading.Event()
+
+
+def _http_mode() -> bool:
+    return os.environ.get("MAILBOX_TRANSPORT", "stdio").strip().lower() == "http"
+
+
+def _resolve_conn_id() -> str:
+    try:
+        return get_context().session_id
+    except RuntimeError:
+        return _DEFAULT_CONN_ID
+
+
+def _state_for(conn_id: str) -> _SessionState:
+    with _SESSIONS_LOCK:
+        st = _SESSIONS.get(conn_id)
+        if st is None:
+            st = _SessionState(conn_id)
+            _SESSIONS[conn_id] = st
+        st.last_activity = time.time()
+        return st
+
+
+def _current_state() -> _SessionState:
+    """Resolve the calling connection's per-session state. Every sync/async
+    tool call goes through this instead of touching a shared global."""
+    return _state_for(_resolve_conn_id())
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -98,47 +157,85 @@ def _session_view(bead: dict) -> dict:
     }
 
 
-def _heartbeat_once() -> dict:
-    if not S.bead_id:
+def _heartbeat_once(st: _SessionState) -> dict:
+    if not st.bead_id:
         return {"ok": False}
-    S.git = detect_git()
+    st.git = detect_git()
     if (
-        S.meta.get("branch") != S.git.branch
-        or S.meta.get("worktree") != S.git.worktree
-        or S.meta.get("project") != S.git.project
+        st.meta.get("branch") != st.git.branch
+        or st.meta.get("worktree") != st.git.worktree
+        or st.meta.get("project") != st.git.project
     ):
-        S.meta["branch"] = S.git.branch
-        S.meta["worktree"] = S.git.worktree
-        S.meta["project"] = S.git.project
-        run_bd("update", S.bead_id, "-d", json.dumps(S.meta), actor=S.sid, check=False)
+        st.meta["branch"] = st.git.branch
+        st.meta["worktree"] = st.git.worktree
+        st.meta["project"] = st.git.project
+        run_bd(
+            "update", st.bead_id, "-d", json.dumps(st.meta), actor=st.sid, check=False
+        )
     run_bd(
-        "set-state", S.bead_id, f"{m.D_HB}={m.hb_now()}", "--reason", "hb", actor=S.sid
+        "set-state",
+        st.bead_id,
+        f"{m.D_HB}={m.hb_now()}",
+        "--reason",
+        "hb",
+        actor=st.sid,
     )
-    with S._lock:
-        lead = L.heartbeat_leader(S.sid, S.git.branch, S.sid)
+    with st._lock:
+        lead = L.heartbeat_leader(st.sid, st.git.branch, st.sid)
         run_bd(
             "set-state",
-            S.bead_id,
+            st.bead_id,
             f"{m.D_ROLE}={lead['role']}",
             "--reason",
             "role sync",
-            actor=S.sid,
+            actor=st.sid,
             check=False,
         )
     return {"ok": True, "role": lead["role"]}
 
 
-def _hb_loop() -> None:
-    while not S._stop.wait(m.HB_BUCKET):
+def _hb_tick_once() -> None:
+    """One pass over every tracked connection: heartbeat it, unless it's an
+    HTTP-mode connection that's gone idle past _CONN_IDLE_SECONDS, in which
+    case treat it as abandoned and clean it up instead (see module docstring
+    in channel.py and README/DESIGN for the tradeoff this makes)."""
+    for st in list(_SESSIONS.values()):
+        if not st.bead_id:
+            continue
+        idle_for = time.time() - st.last_activity
+        if (
+            _http_mode()
+            and st.conn_id != _DEFAULT_CONN_ID
+            and idle_for > _CONN_IDLE_SECONDS
+        ):
+            _deregister_state(st)
+            with _SESSIONS_LOCK:
+                _SESSIONS.pop(st.conn_id, None)
+            continue
         try:
-            _heartbeat_once()
+            _heartbeat_once(st)
         except (
             Exception
         ) as exc:  # never let the daemon thread die on a transient bd error
-            logger.warning("heartbeat failed: %s", exc)
+            logger.warning("heartbeat failed for %s: %s", st.sid, exc)
 
 
-def _reap_stale() -> None:
+def _hb_loop() -> None:
+    # One shared thread iterating every live connection, not one thread per
+    # connection: HTTP mode can have many concurrent connections and spawning
+    # (and tearing down) a thread per connection is unnecessary complexity for
+    # what's fundamentally a periodic sweep — a single loop over a dict is
+    # simpler and just as correct, and it's what already reaps stale entries.
+    while not _stop.wait(m.HB_BUCKET):
+        try:
+            _hb_tick_once()
+        except (
+            Exception
+        ) as exc:  # never let the daemon thread die on a transient bd error
+            logger.warning("heartbeat tick failed: %s", exc)
+
+
+def _reap_stale(actor_sid: str) -> None:
     """Close session beads whose heartbeat is >10x stale (crashed sessions)."""
     for row in run_bd_json("query", f"label={m.L_SESSION} AND status=open") or []:
         st = L.states_of(row)
@@ -151,10 +248,10 @@ def _reap_stale() -> None:
                 f"{m.D_STATUS}=done",
                 "--reason",
                 "reaped: stale",
-                actor=S.sid,
+                actor=actor_sid,
                 check=False,
             )
-            run_bd("close", row["id"], actor=S.sid, check=False)
+            run_bd("close", row["id"], actor=actor_sid, check=False)
             reaped_sid = next(
                 (
                     lbl.removeprefix("session:")
@@ -163,43 +260,44 @@ def _reap_stale() -> None:
                 ),
                 None,
             )
-            if reaped_sid and L.read_leader(S.sid).get("leader_sid") == reaped_sid:
+            if reaped_sid and L.read_leader(actor_sid).get("leader_sid") == reaped_sid:
                 # The reaped session was still holding the leader slot — vacate it
                 # so a live session can fail over instead of waiting for the next
                 # main-branch heartbeat to notice staleness.
-                L.release(reaped_sid, S.sid, check=False)
+                L.release(reaped_sid, actor_sid, check=False)
 
 
 def _channel_loop() -> None:
-    while not S._stop.wait(CHANNEL_POLL_SECONDS):
+    while not _stop.wait(CHANNEL_POLL_SECONDS):
         try:
-            _deliver_channel()
+            for st in list(_SESSIONS.values()):
+                _deliver_channel(st)
         except Exception as exc:  # keep the daemon alive on transient bd errors
             logger.warning("channel delivery failed: %s", exc)
 
 
-def _seed_seen() -> None:
+def _seed_seen(st: _SessionState) -> None:
     """Mark all currently-present inbound + subscribed-channel messages as already
     delivered, so the channel pushes only messages that arrive AFTER we join (no
     startup backlog flood). The pull tools still surface any pre-existing items."""
-    for r in run_bd_json("query", f"assignee={S.sid} AND status=open") or []:
-        S._seen.add(r["id"])
-    for chan in S.subscribed_channels():
+    for r in run_bd_json("query", f"assignee={st.sid} AND status=open") or []:
+        st._seen.add(r["id"])
+    for chan in st.subscribed_channels():
         q = f"label={m.L_MESSAGE} AND label={m.channel_label(chan)}"
         for r in run_bd_json("query", q) or []:
-            S._seen.add(r["id"])
+            st._seen.add(r["id"])
 
 
-def _deliver_channel() -> None:
+def _deliver_channel(st: _SessionState) -> None:
     """Push new inbound to the session as claude/channel events. Delivery-once via
-    S._seen. DMs are closed after push (delivered = read); requests stay open so
+    st._seen. DMs are closed after push (delivered = read); requests stay open so
     the model can respond_info to them."""
-    if not S.bead_id or not ch.is_live():
+    if not st.bead_id or not ch.is_live(st.channel):
         return
     # 1. items addressed to us: DMs, info-requests, delegations
-    for r in run_bd_json("query", f"assignee={S.sid} AND status=open") or []:
+    for r in run_bd_json("query", f"assignee={st.sid} AND status=open") or []:
         rid = r["id"]
-        if rid in S._seen:
+        if rid in st._seen:
             continue
         labels = r.get("labels") or []
         try:
@@ -216,6 +314,7 @@ def _deliver_channel() -> None:
             continue
         text = meta.get("text") or r.get("title") or ""
         pushed = ch.push(
+            st.channel,
             text,
             {
                 "kind": kind,
@@ -225,24 +324,25 @@ def _deliver_channel() -> None:
             },
         )
         if pushed:
-            S._seen.add(rid)
+            st._seen.add(rid)
             if kind == "dm":
-                run_bd("close", rid, actor=S.sid, check=False)
+                run_bd("close", rid, actor=st.sid, check=False)
     # 2. broadcasts on our subscribed channels (skip our own)
-    for chan in S.subscribed_channels():
+    for chan in st.subscribed_channels():
         q = f"label={m.L_MESSAGE} AND label={m.channel_label(chan)}"
         for r in run_bd_json("query", q) or []:
             rid = r["id"]
-            if rid in S._seen:
+            if rid in st._seen:
                 continue
-            if m.from_label(S.sid) in (r.get("labels") or []):
-                S._seen.add(rid)  # our own broadcast — don't echo it back to us
+            if m.from_label(st.sid) in (r.get("labels") or []):
+                st._seen.add(rid)  # our own broadcast — don't echo it back to us
                 continue
             try:
                 meta = json.loads(r.get("description") or "{}")
             except (json.JSONDecodeError, TypeError):
                 meta = {}
             if ch.push(
+                st.channel,
                 meta.get("text") or r.get("title") or "",
                 {
                     "kind": "broadcast",
@@ -251,7 +351,18 @@ def _deliver_channel() -> None:
                     "bead_id": rid,
                 },
             ):
-                S._seen.add(rid)
+                st._seen.add(rid)
+
+
+def _ensure_background_threads() -> None:
+    global _hb_thread, _ch_thread
+    with _threads_lock:
+        if not _hb_thread:
+            _hb_thread = threading.Thread(target=_hb_loop, daemon=True)
+            _hb_thread.start()
+        if not _ch_thread:
+            _ch_thread = threading.Thread(target=_channel_loop, daemon=True)
+            _ch_thread.start()
 
 
 # ── tools ────────────────────────────────────────────────────────────────────
@@ -260,28 +371,34 @@ async def register_session(objective: str, ctx: Context) -> dict:
     """Register this Claude session in the mailbox and start heartbeating.
 
     project/branch/worktree are auto-detected from git. Auto-claims leadership
-    if on the main branch. Idempotent for the process lifetime. Also captures the
-    live session so peer messages can be pushed as claude/channel events.
+    if on the main branch. Idempotent for the connection's lifetime (one
+    process per session under stdio; one entry per connection under HTTP).
+    Also captures the live session so peer messages can be pushed as
+    claude/channel events.
     """
-    ch.capture(ctx)  # async tool → we're on the server loop; grabs session+loop
-    return await asyncio.to_thread(_register_impl, objective)
+    st = _state_for(ctx.session_id)
+    if st.channel is None:
+        st.channel = ch.capture(
+            ctx
+        )  # async tool → on the server loop; grabs session+loop
+    return await asyncio.to_thread(_register_impl, st, objective)
 
 
-def _register_impl(objective: str) -> dict:
-    g = S.git = detect_git()
-    if S.bead_id:  # already registered — just refresh objective
-        return update_objective(objective)
+def _register_impl(st: _SessionState, objective: str) -> dict:
+    g = st.git = detect_git()
+    if st.bead_id:  # already registered — just refresh objective
+        return _update_objective(st, objective)
     meta = {
-        "sid": S.sid,
+        "sid": st.sid,
         "project": g.project,
         "branch": g.branch,
         "worktree": g.worktree,
         "objective": objective,
         "machine": hostname(),
     }
-    S.meta = meta
+    st.meta = meta
     title = f"[session] {g.project}@{g.branch} — {objective}"[:200]
-    S.bead_id = run_bd(
+    st.bead_id = run_bd(
         "q",
         title,
         "-t",
@@ -290,51 +407,51 @@ def _register_impl(objective: str) -> dict:
         ",".join(
             [
                 m.L_SESSION,
-                m.sid_label(S.sid),
+                m.sid_label(st.sid),
                 f"project:{g.project}",
                 f"branch:{g.branch}",
                 f"machine:{hostname()}",
             ]
         ),
-        actor=S.sid,
+        actor=st.sid,
     ).strip()
-    run_bd("update", S.bead_id, "-d", json.dumps(meta), actor=S.sid, check=False)
+    run_bd("update", st.bead_id, "-d", json.dumps(meta), actor=st.sid, check=False)
     run_bd(
-        "set-state", S.bead_id, f"{m.D_STATUS}=active", "--reason", "start", actor=S.sid
+        "set-state",
+        st.bead_id,
+        f"{m.D_STATUS}=active",
+        "--reason",
+        "start",
+        actor=st.sid,
     )
     run_bd(
         "set-state",
-        S.bead_id,
+        st.bead_id,
         f"{m.D_HB}={m.hb_now()}",
         "--reason",
         "start",
-        actor=S.sid,
+        actor=st.sid,
     )
-    with S._lock:
-        lead = L.heartbeat_leader(S.sid, g.branch, S.sid)
+    with st._lock:
+        lead = L.heartbeat_leader(st.sid, g.branch, st.sid)
         run_bd(
             "set-state",
-            S.bead_id,
+            st.bead_id,
             f"{m.D_ROLE}={lead['role']}",
             "--reason",
             "start",
-            actor=S.sid,
+            actor=st.sid,
             check=False,
         )
-    _reap_stale()
-    _seed_seen()  # only push messages that arrive after we join
-    if not S._hb_thread:
-        S._hb_thread = threading.Thread(target=_hb_loop, daemon=True)
-        S._hb_thread.start()
-    if not S._ch_thread and ch.is_live():
-        S._ch_thread = threading.Thread(target=_channel_loop, daemon=True)
-        S._ch_thread.start()
+    _reap_stale(st.sid)
+    _seed_seen(st)  # only push messages that arrive after we join
+    _ensure_background_threads()
     return {
-        "sid": S.sid,
-        "bead_id": S.bead_id,
+        "sid": st.sid,
+        "bead_id": st.bead_id,
         "role": lead["role"],
-        "leader": L.read_leader(S.sid),
-        "channel": "live" if ch.is_live() else "not-registered-as-channel",
+        "leader": L.read_leader(st.sid),
+        "channel": "live" if ch.is_live(st.channel) else "not-registered-as-channel",
     }
 
 
@@ -342,32 +459,37 @@ def _register_impl(objective: str) -> dict:
 def heartbeat() -> dict:
     """Manually pump a heartbeat and return role + inbox (the background
     thread heartbeats automatically; call it to force a fresh read)."""
-    r = _heartbeat_once()
+    st = _current_state()
+    r = _heartbeat_once(st)
     return {
         **r,
-        "leader": L.read_leader(S.sid),
-        "inbox": poll_inbox(mark_read=False),
+        "leader": L.read_leader(st.sid),
+        "inbox": _poll_inbox(st, mark_read=False),
     }
+
+
+def _update_objective(st: _SessionState, objective: str) -> dict:
+    if not st.bead_id:
+        return {"ok": False, "error": "not registered"}
+    g = st.git
+    st.meta["objective"] = objective
+    run_bd(
+        "update",
+        st.bead_id,
+        "--title",
+        f"[session] {g.project}@{g.branch} — {objective}"[:200],
+        "-d",
+        json.dumps(st.meta),
+        actor=st.sid,
+    )
+    run_bd("note", st.bead_id, f"objective: {objective}", actor=st.sid, check=False)
+    return {"ok": True}
 
 
 @mcp.tool
 def update_objective(objective: str) -> dict:
     """Update this session's advertised objective."""
-    if not S.bead_id:
-        return {"ok": False, "error": "not registered"}
-    g = S.git
-    S.meta["objective"] = objective
-    run_bd(
-        "update",
-        S.bead_id,
-        "--title",
-        f"[session] {g.project}@{g.branch} — {objective}"[:200],
-        "-d",
-        json.dumps(S.meta),
-        actor=S.sid,
-    )
-    run_bd("note", S.bead_id, f"objective: {objective}", actor=S.sid, check=False)
-    return {"ok": True}
+    return _update_objective(_current_state(), objective)
 
 
 @mcp.tool
@@ -375,15 +497,16 @@ def set_status(status: str) -> dict:
     """Set this session's status: active | idle | blocked | done."""
     if status not in ("active", "idle", "blocked", "done"):
         return {"ok": False, "error": "bad status"}
-    if not S.bead_id:
+    st = _current_state()
+    if not st.bead_id:
         return {"ok": False, "error": "not registered"}
     run_bd(
         "set-state",
-        S.bead_id,
+        st.bead_id,
         f"{m.D_STATUS}={status}",
         "--reason",
         "set_status",
-        actor=S.sid,
+        actor=st.sid,
     )
     return {"ok": True}
 
@@ -403,21 +526,23 @@ def list_sessions(include_stale: bool = False, project: str | None = None) -> li
 @mcp.tool
 def get_leader() -> dict:
     """Who is the current leader/orchestrator (the session on main)?"""
-    return L.read_leader(S.sid)
+    return L.read_leader(_current_state().sid)
 
 
 @mcp.tool
 def claim_leadership(force: bool = False) -> dict:
     """Attempt to become leader. Only succeeds on the main branch unless force."""
-    with S._lock:
-        return L.claim(S.sid, S.git.branch, S.sid, force=force)
+    st = _current_state()
+    with st._lock:
+        return L.claim(st.sid, st.git.branch, st.sid, force=force)
 
 
 @mcp.tool
 def release_leadership() -> dict:
     """Voluntarily give up leadership."""
-    with S._lock:
-        return L.release(S.sid, S.sid)
+    st = _current_state()
+    with st._lock:
+        return L.release(st.sid, st.sid)
 
 
 @mcp.tool
@@ -425,14 +550,15 @@ def broadcast(text: str, channel: str = "general") -> dict:
     """Broadcast a message to a channel that all sessions can read."""
     if not m.valid_token(channel):
         return {"ok": False, "error": "invalid channel: must match [A-Za-z0-9._-]"}
-    payload = json.dumps({"text": text, "from": S.sid, "channel": channel})
+    st = _current_state()
+    payload = json.dumps({"text": text, "from": st.sid, "channel": channel})
     mid = create(
         f"[msg] {channel}: {text}"[:200],
         type="event",
-        labels=[m.L_MESSAGE, m.channel_label(channel), m.from_label(S.sid)],
+        labels=[m.L_MESSAGE, m.channel_label(channel), m.from_label(st.sid)],
         ephemeral=True,
         description=payload,
-        actor=S.sid,
+        actor=st.sid,
     )
     return {"message_id": mid}
 
@@ -471,27 +597,25 @@ def send_dm(to_sid: str, text: str) -> dict:
     """Send a direct message to a specific session."""
     if not m.valid_token(to_sid):
         return {"ok": False, "error": "invalid to_sid: must match [A-Za-z0-9._-]"}
-    payload = json.dumps({"text": text, "from": S.sid})
+    st = _current_state()
+    payload = json.dumps({"text": text, "from": st.sid})
     mid = create(
         f"[dm] to {to_sid}: {text}"[:200],
         type="event",
-        labels=[m.L_MESSAGE, m.L_DM, m.from_label(S.sid)],
+        labels=[m.L_MESSAGE, m.L_DM, m.from_label(st.sid)],
         ephemeral=True,
         description=payload,
-        actor=S.sid,
+        actor=st.sid,
     )
     try:
-        run_bd("assign", mid, to_sid, actor=S.sid, check=True)
+        run_bd("assign", mid, to_sid, actor=st.sid, check=True)
     except BdError as e:
         return {"message_id": mid, "delivered": False, "error": str(e)}
     return {"message_id": mid, "delivered": True}
 
 
-@mcp.tool
-def poll_inbox(mark_read: bool = True) -> dict:
-    """Read messages/delegations addressed to this session. Closes DMs when
-    mark_read is true (a closed DM = read)."""
-    rows = run_bd_json("query", f"assignee={S.sid} AND status=open") or []
+def _poll_inbox(st: _SessionState, mark_read: bool = True) -> dict:
+    rows = run_bd_json("query", f"assignee={st.sid} AND status=open") or []
     dms, delegations, requests = [], [], []
     for r in rows:
         labels = r.get("labels") or []
@@ -512,8 +636,15 @@ def poll_inbox(mark_read: bool = True) -> dict:
         elif m.L_DM in labels:
             dms.append(item)
             if mark_read:
-                run_bd("close", r["id"], actor=S.sid, check=False)
+                run_bd("close", r["id"], actor=st.sid, check=False)
     return {"dms": dms, "delegations": delegations, "requests": requests}
+
+
+@mcp.tool
+def poll_inbox(mark_read: bool = True) -> dict:
+    """Read messages/delegations addressed to this session. Closes DMs when
+    mark_read is true (a closed DM = read)."""
+    return _poll_inbox(_current_state(), mark_read=mark_read)
 
 
 def _bead_status(bead_id: str) -> str | None:
@@ -545,17 +676,18 @@ def request_info(to_sid: str, question: str, timeout_s: int = 60) -> dict:
     """
     if not m.valid_token(to_sid):
         return {"ok": False, "error": "invalid to_sid: must match [A-Za-z0-9._-]"}
-    payload = json.dumps({"text": question, "from": S.sid})
+    st = _current_state()
+    payload = json.dumps({"text": question, "from": st.sid})
     rid = create(
         f"[req] to {to_sid}: {question}"[:200],
         type="task",
-        labels=[m.L_REQUEST, m.from_label(S.sid)],
+        labels=[m.L_REQUEST, m.from_label(st.sid)],
         ephemeral=False,
         description=payload,
-        actor=S.sid,
+        actor=st.sid,
     )
     try:
-        run_bd("assign", rid, to_sid, actor=S.sid, check=True)
+        run_bd("assign", rid, to_sid, actor=st.sid, check=True)
     except BdError as e:
         return {"request_id": rid, "resolved": False, "error": f"assign failed: {e}"}
     deadline = time.time() + max(0, timeout_s)
@@ -575,8 +707,9 @@ def request_info(to_sid: str, question: str, timeout_s: int = 60) -> dict:
 def respond_info(request_id: str, answer: str) -> dict:
     """Answer an info-request (from poll_inbox 'requests'): comment + close,
     which unblocks the asking session."""
-    run_bd("comment", request_id, answer, actor=S.sid)
-    run_bd("close", request_id, actor=S.sid, check=False)
+    st = _current_state()
+    run_bd("comment", request_id, answer, actor=st.sid)
+    run_bd("close", request_id, actor=st.sid, check=False)
     return {"ok": True}
 
 
@@ -598,10 +731,11 @@ def delegate(to_sid: str, title: str, detail: str = "", priority: int = 2) -> di
     """Leader-only: assign a work item to a secondary session."""
     if not m.valid_token(to_sid):
         return {"ok": False, "error": "invalid to_sid: must match [A-Za-z0-9._-]"}
+    st = _current_state()
     # Re-read the leader slot on every call (not cached) to guard against a stale
     # leadership belief — e.g. this session lost leadership since it last checked.
-    lead = L.read_leader(S.sid)
-    if lead.get("leader_sid") != S.sid:
+    lead = L.read_leader(st.sid)
+    if lead.get("leader_sid") != st.sid:
         return {"ok": False, "error": "not the leader"}
     tid = run_bd(
         "q",
@@ -611,46 +745,54 @@ def delegate(to_sid: str, title: str, detail: str = "", priority: int = 2) -> di
         "-p",
         str(priority),
         "-l",
-        ",".join([m.L_DELEGATION, m.from_label(S.sid)]),
-        actor=S.sid,
+        ",".join([m.L_DELEGATION, m.from_label(st.sid)]),
+        actor=st.sid,
     ).strip()
     if detail:
-        run_bd("update", tid, "-d", detail, actor=S.sid, check=False)
-    run_bd("assign", tid, to_sid, actor=S.sid, check=False)
+        run_bd("update", tid, "-d", detail, actor=st.sid, check=False)
+    run_bd("assign", tid, to_sid, actor=st.sid, check=False)
     return {"ok": True, "task_id": tid}
 
 
 @mcp.tool
 def deregister() -> dict:
     """Cleanly leave the mailbox: release leadership, mark done, close bead."""
-    return _deregister()
+    return _deregister_state(_current_state())
 
 
-def _deregister() -> dict:
-    S._stop.set()
-    if not S.bead_id:
+def _deregister_state(st: _SessionState) -> dict:
+    if not st.bead_id:
         return {"ok": True}
-    with S._lock:
-        L.release(S.sid, S.sid)
+    with st._lock:
+        L.release(st.sid, st.sid)
     run_bd(
         "set-state",
-        S.bead_id,
+        st.bead_id,
         f"{m.D_STATUS}=done",
         "--reason",
         "exit",
-        actor=S.sid,
+        actor=st.sid,
         check=False,
     )
-    run_bd("close", S.bead_id, actor=S.sid, check=False)
-    S.bead_id = None
+    run_bd("close", st.bead_id, actor=st.sid, check=False)
+    st.bead_id = None
     return {"ok": True}
 
 
-atexit.register(_deregister)
+def _deregister_all() -> None:
+    """Process-shutdown path: deregister every tracked connection. For stdio
+    there's exactly one, so this is the same cleanup as before; for HTTP it
+    covers every connection this process still knows about."""
+    _stop.set()
+    for st in list(_SESSIONS.values()):
+        _deregister_state(st)
+
+
+atexit.register(_deregister_all)
 
 
 def _sig(_signum, _frame):
-    _deregister()
+    _deregister_all()
     sys.exit(0)
 
 

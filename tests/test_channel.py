@@ -37,9 +37,20 @@ def test_sanitize_meta_drops_bad_keys_and_none():
     assert "bad-key" not in out and "n" not in out
 
 
-def test_push_noop_without_live_session(monkeypatch):
-    # Fresh state: no captured session → push is a no-op returning False.
-    monkeypatch.setattr(ch._CH, "session", None)
-    monkeypatch.setattr(ch._CH, "loop", None)
-    assert ch.is_live() is False
-    assert ch.push("hello", {"kind": "dm"}) is False
+def test_push_noop_without_live_session():
+    # No captured state for this connection → push is a no-op returning False.
+    assert ch.is_live(None) is False
+    assert ch.push(None, "hello", {"kind": "dm"}) is False
+
+
+def test_push_noop_when_state_not_captured():
+    # A ChannelState that never captured a session/loop is not live either.
+    state = ch.ChannelState()
+    assert ch.is_live(state) is False
+    assert ch.push(state, "hello", {"kind": "dm"}) is False
+
+
+def test_capture_returns_none_outside_running_loop():
+    # capture() must be called from an async tool on the server loop; from a
+    # plain sync context there's no running loop, so it returns None.
+    assert ch.capture(object()) is None
