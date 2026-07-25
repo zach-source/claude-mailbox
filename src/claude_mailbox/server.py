@@ -14,6 +14,7 @@ import asyncio
 import atexit
 import json
 import logging
+import os
 import signal
 import sys
 import threading
@@ -656,7 +657,14 @@ def _sig(_signum, _frame):
 def main() -> None:
     signal.signal(signal.SIGTERM, _sig)
     signal.signal(signal.SIGINT, _sig)
-    mcp.run()
+    if os.environ.get("MAILBOX_TRANSPORT", "stdio") == "http":
+        mcp.run(
+            transport="http",
+            host=os.environ.get("MAILBOX_HTTP_HOST", "127.0.0.1"),
+            port=int(os.environ.get("MAILBOX_HTTP_PORT", "8000")),
+        )
+    else:
+        mcp.run()
 
 
 if __name__ == "__main__":
