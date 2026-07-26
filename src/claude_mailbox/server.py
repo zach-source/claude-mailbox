@@ -19,12 +19,14 @@ import atexit
 import json
 import logging
 import os
+import secrets
 import signal
 import sys
 import threading
 import time
 
 from fastmcp import Context, FastMCP
+from fastmcp.server.auth import AccessToken, TokenVerifier
 from fastmcp.server.dependencies import get_context
 
 from . import channel as ch
@@ -796,14 +798,59 @@ def _sig(_signum, _frame):
     sys.exit(0)
 
 
+# ── HTTP bearer-token auth (design: global-4pm P0) ──────────────────────────
+# stdio inherits the launching OS user's trust already, so it's exempt; HTTP
+# binds a TCP port any local (or LAN) process can reach, so it's gated.
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _load_token() -> str | None:
+    token = os.environ.get("MAILBOX_TOKEN", "").strip()
+    if token:
+        return token
+    path = os.environ.get("MAILBOX_TOKEN_FILE")
+    if path:
+        with open(path) as f:
+            return f.read().strip()
+    return None
+
+
+class _BearerTokenVerifier(TokenVerifier):
+    """Single shared deployment token, constant-time compare."""
+
+    def __init__(self, token: str) -> None:
+        super().__init__()
+        self._token = token
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        if not secrets.compare_digest(token, self._token):
+            return None
+        return AccessToken(token=token, client_id="mailbox", scopes=[])
+
+
 def main() -> None:
     signal.signal(signal.SIGTERM, _sig)
     signal.signal(signal.SIGINT, _sig)
     if os.environ.get("MAILBOX_TRANSPORT", "stdio") == "http":
+        host = os.environ.get("MAILBOX_HTTP_HOST", "127.0.0.1")
+        token = _load_token()
+        if not token and host not in _LOOPBACK_HOSTS:
+            raise SystemExit(
+                f"refusing to start: MAILBOX_HTTP_HOST={host!r} is not loopback and "
+                "no MAILBOX_TOKEN/MAILBOX_TOKEN_FILE is set — set one of them or bind "
+                "to 127.0.0.1"
+            )
+        if not token:
+            logger.warning(
+                "MAILBOX_TRANSPORT=http with no MAILBOX_TOKEN set — any local process "
+                "on this machine can reach the mailbox. Set MAILBOX_TOKEN before "
+                "relying on this beyond a trusted single-user machine."
+            )
         mcp.run(
             transport="http",
-            host=os.environ.get("MAILBOX_HTTP_HOST", "127.0.0.1"),
+            host=host,
             port=int(os.environ.get("MAILBOX_HTTP_PORT", "8000")),
+            auth=_BearerTokenVerifier(token) if token else None,
         )
     else:
         mcp.run()
