@@ -547,10 +547,14 @@ def get_leader() -> dict:
 
 @mcp.tool
 def claim_leadership(force: bool = False) -> dict:
-    """Attempt to become leader. Only succeeds on the main branch unless force."""
+    """Attempt to become leader. Only succeeds on the main branch unless force.
+    force is restricted to stdio (global-tvr) — an HTTP caller force-claiming
+    leadership would gain delegate() over every session."""
     st = _current_state()
     if (err := _require_registered(st)) is not None:
         return err
+    if force and _http_mode():
+        return {"granted": False, "reason": "force requires stdio transport"}
     with st._lock:
         return L.claim(st.sid, st.git.branch, st.sid, force=force)
 
