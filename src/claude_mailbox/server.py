@@ -683,6 +683,15 @@ def _bead_status(bead_id: str) -> str | None:
     return bead.get("status") if isinstance(bead, dict) else None
 
 
+def _bead_assignee(bead_id: str) -> str | None:
+    try:
+        rows = run_bd_json("show", bead_id)
+    except BdError:
+        return None
+    bead = rows[0] if isinstance(rows, list) and rows else rows
+    return bead.get("assignee") if isinstance(bead, dict) else None
+
+
 def _last_answer(bead_id: str) -> str | None:
     try:
         comments = run_bd_json("comments", bead_id) or []
@@ -735,10 +744,14 @@ def request_info(to_sid: str, question: str, timeout_s: int = 60) -> dict:
 @mcp.tool
 def respond_info(request_id: str, answer: str) -> dict:
     """Answer an info-request (from poll_inbox 'requests'): comment + close,
-    which unblocks the asking session."""
+    which unblocks the asking session. Only the session the request is
+    assigned to may answer it (global-5yn) — otherwise any connection could
+    forge an answer to another agent's blocking request_info call."""
     st = _current_state()
     if (err := _require_registered(st)) is not None:
         return err
+    if _bead_assignee(request_id) != st.sid:
+        return {"ok": False, "error": "request not assigned to you"}
     run_bd("comment", request_id, answer, actor=st.sid)
     run_bd("close", request_id, actor=st.sid, check=False)
     return {"ok": True}
