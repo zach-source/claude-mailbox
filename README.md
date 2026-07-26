@@ -68,6 +68,8 @@ Environment variables:
 | `MAILBOX_TRANSPORT` | `stdio` | `stdio` (unchanged default) or `http` |
 | `MAILBOX_HTTP_HOST` | `127.0.0.1` | Bind host when `MAILBOX_TRANSPORT=http` |
 | `MAILBOX_HTTP_PORT` | `8000` | Bind port when `MAILBOX_TRANSPORT=http` |
+| `MAILBOX_TOKEN` | unset | Shared bearer token required on every HTTP request (`Authorization: Bearer <token>`). Loopback host without a token just warns; a non-loopback `MAILBOX_HTTP_HOST` refuses to start without one |
+| `MAILBOX_TOKEN_FILE` | unset | Path to a file containing the token, as an alternative to `MAILBOX_TOKEN` |
 | `MAILBOX_GLOBAL` | `1` (true) | `1`/`true` (default) passes `--global`, routing `bd` at the shared `beads_global` DB — today's behavior. `0`/`false`/`no` omits `--global` entirely, so `bd` resolves a plain local project database under `WORKSPACE` via its default embedded engine (`bd init` with no `--server`/`--external`/`--shared-server`) |
 
 Run it as a standalone HTTP service backed by its own local database:
@@ -75,8 +77,12 @@ Run it as a standalone HTTP service backed by its own local database:
 cd /path/to/claude-mailbox     # WORKSPACE — where the local .beads/ will live
 bd init --non-interactive      # one-time: creates the local embedded db
 MAILBOX_TRANSPORT=http MAILBOX_HTTP_HOST=0.0.0.0 MAILBOX_HTTP_PORT=8000 \
-  MAILBOX_GLOBAL=0 uv run claude-mailbox
+  MAILBOX_TOKEN=$(openssl rand -hex 32) MAILBOX_GLOBAL=0 uv run claude-mailbox
 ```
+A non-loopback `MAILBOX_HTTP_HOST` (like `0.0.0.0` above) refuses to start
+without `MAILBOX_TOKEN`/`MAILBOX_TOKEN_FILE` set — any local (or LAN) process
+can otherwise reach the mailbox. Configure the same token as an `Authorization:
+Bearer <token>` header in the MCP client pointed at this server.
 Then add it to a Claude Code session on another machine as an `http`-type MCP
 server entry pointing at `http://<pod-host>:8000/mcp`, or point any MCP-capable
 HTTP client (including a non-Claude Python daemon) at the same URL.
@@ -123,8 +129,14 @@ docker run --rm -v mailbox-data:/data --user mailbox \
   --entrypoint bd ghcr.io/<owner>/claude-mailbox:latest init --non-interactive
 
 docker run -d --name claude-mailbox -p 8000:8000 \
+  -e MAILBOX_TOKEN=$(openssl rand -hex 32) \
   -v mailbox-data:/data ghcr.io/<owner>/claude-mailbox:latest
 ```
+
+The container binds `0.0.0.0` internally (so Docker's own port mapping can
+reach it) — a non-loopback bind refuses to start without `MAILBOX_TOKEN`, so
+it's required here, not optional. Save the token you pass; the MCP client
+needs the same value as an `Authorization: Bearer <token>` header.
 
 Then wire it into a Claude Code session elsewhere as an `http`-type MCP server
 entry pointing at `http://<host>:8000/mcp` (see "HTTP mode" above for the

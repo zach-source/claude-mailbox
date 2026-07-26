@@ -704,6 +704,21 @@ def _last_answer(bead_id: str) -> str | None:
     return comments[-1].get("text") if comments else None
 
 
+def _bead_from(bead_id: str) -> str | None:
+    try:
+        rows = run_bd_json("show", bead_id)
+    except BdError:
+        return None
+    bead = rows[0] if isinstance(rows, list) and rows else rows
+    if not isinstance(bead, dict):
+        return None
+    try:
+        meta = json.loads(bead.get("description") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return meta.get("from")
+
+
 @mcp.tool
 def request_info(to_sid: str, question: str, timeout_s: int = 60) -> dict:
     """Ask another session a question and block (up to timeout_s) for its answer.
@@ -763,7 +778,12 @@ def respond_info(request_id: str, answer: str) -> dict:
 
 @mcp.tool
 def check_request(request_id: str) -> dict:
-    """Non-blocking: has an info-request been answered yet?"""
+    """Non-blocking: has an info-request been answered yet? Only the session
+    that created the request may poll it — otherwise any connection could
+    read another agent's answer by guessing/enumerating request_ids."""
+    st = _current_state()
+    if _bead_from(request_id) != st.sid:
+        return {"resolved": False, "answer": None, "gone": True}
     status = _bead_status(request_id)
     if status is None:
         return {"resolved": False, "answer": None, "gone": True}
@@ -859,7 +879,10 @@ def _load_token() -> str | None:
     path = os.environ.get("MAILBOX_TOKEN_FILE")
     if path:
         with open(path) as f:
-            return f.read().strip()
+            token = f.read().strip()
+        if not token:
+            raise SystemExit(f"MAILBOX_TOKEN_FILE={path!r} is empty")
+        return token
     return None
 
 
@@ -868,10 +891,13 @@ class _BearerTokenVerifier(TokenVerifier):
 
     def __init__(self, token: str) -> None:
         super().__init__()
-        self._token = token
+        self._token = token.encode()
 
     async def verify_token(self, token: str) -> AccessToken | None:
-        if not secrets.compare_digest(token, self._token):
+        # compare as bytes: secrets.compare_digest rejects non-ASCII str input,
+        # which would otherwise turn a garbage bearer token into a 500 instead
+        # of a clean 401.
+        if not secrets.compare_digest(token.encode(), self._token):
             return None
         return AccessToken(token=token, client_id="mailbox", scopes=[])
 
@@ -894,11 +920,14 @@ def main() -> None:
                 "on this machine can reach the mailbox. Set MAILBOX_TOKEN before "
                 "relying on this beyond a trusted single-user machine."
             )
+        # `auth` is a FastMCP constructor attribute, not a run()/run_http_async()
+        # kwarg — it must be set on the server object before run() builds the
+        # ASGI app, or HTTP auth is silently never enforced.
+        mcp.auth = _BearerTokenVerifier(token) if token else None
         mcp.run(
             transport="http",
             host=host,
             port=int(os.environ.get("MAILBOX_HTTP_PORT", "8000")),
-            auth=_BearerTokenVerifier(token) if token else None,
         )
     else:
         mcp.run()
