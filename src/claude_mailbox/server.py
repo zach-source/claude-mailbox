@@ -131,6 +131,20 @@ def _current_state() -> _SessionState:
     return _state_for(_resolve_conn_id())
 
 
+_NOT_REGISTERED = {"ok": False, "error": "not registered"}
+
+
+def _require_registered(st: _SessionState) -> dict | None:
+    """Single choke point (design: global-4pm P1): tools that act on behalf of
+    a session must not run on a connection that never called register_session
+    — otherwise gating register_session alone is security theater, since
+    _current_state() lazily mints a sid for anyone. Returns an error dict to
+    short-circuit the caller, or None if the connection is registered."""
+    if not st.bead_id:
+        return dict(_NOT_REGISTERED)
+    return None
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 def _find_session(sid: str) -> dict | None:
     rows = run_bd_json("query", f"label={m.sid_label(sid)}") or []
@@ -500,8 +514,8 @@ def set_status(status: str) -> dict:
     if status not in ("active", "idle", "blocked", "done"):
         return {"ok": False, "error": "bad status"}
     st = _current_state()
-    if not st.bead_id:
-        return {"ok": False, "error": "not registered"}
+    if (err := _require_registered(st)) is not None:
+        return err
     run_bd(
         "set-state",
         st.bead_id,
@@ -535,6 +549,8 @@ def get_leader() -> dict:
 def claim_leadership(force: bool = False) -> dict:
     """Attempt to become leader. Only succeeds on the main branch unless force."""
     st = _current_state()
+    if (err := _require_registered(st)) is not None:
+        return err
     with st._lock:
         return L.claim(st.sid, st.git.branch, st.sid, force=force)
 
@@ -553,6 +569,8 @@ def broadcast(text: str, channel: str = "general") -> dict:
     if not m.valid_token(channel):
         return {"ok": False, "error": "invalid channel: must match [A-Za-z0-9._-]"}
     st = _current_state()
+    if (err := _require_registered(st)) is not None:
+        return err
     payload = json.dumps({"text": text, "from": st.sid, "channel": channel})
     mid = create(
         f"[msg] {channel}: {text}"[:200],
@@ -566,10 +584,12 @@ def broadcast(text: str, channel: str = "general") -> dict:
 
 
 @mcp.tool
-def read_channel(channel: str, limit: int = 20) -> list:
+def read_channel(channel: str, limit: int = 20) -> list | dict:
     """Read recent messages on a channel (newest first)."""
     if not m.valid_token(channel):
         return {"ok": False, "error": "invalid channel: must match [A-Za-z0-9._-]"}
+    if (err := _require_registered(_current_state())) is not None:
+        return err
     rows = (
         run_bd_json(
             "query", f"label={m.L_MESSAGE} AND label={m.channel_label(channel)}"
@@ -600,6 +620,8 @@ def send_dm(to_sid: str, text: str) -> dict:
     if not m.valid_token(to_sid):
         return {"ok": False, "error": "invalid to_sid: must match [A-Za-z0-9._-]"}
     st = _current_state()
+    if (err := _require_registered(st)) is not None:
+        return err
     payload = json.dumps({"text": text, "from": st.sid})
     mid = create(
         f"[dm] to {to_sid}: {text}"[:200],
@@ -646,7 +668,10 @@ def _poll_inbox(st: _SessionState, mark_read: bool = True) -> dict:
 def poll_inbox(mark_read: bool = True) -> dict:
     """Read messages/delegations addressed to this session. Closes DMs when
     mark_read is true (a closed DM = read)."""
-    return _poll_inbox(_current_state(), mark_read=mark_read)
+    st = _current_state()
+    if (err := _require_registered(st)) is not None:
+        return err
+    return _poll_inbox(st, mark_read=mark_read)
 
 
 def _bead_status(bead_id: str) -> str | None:
@@ -679,6 +704,8 @@ def request_info(to_sid: str, question: str, timeout_s: int = 60) -> dict:
     if not m.valid_token(to_sid):
         return {"ok": False, "error": "invalid to_sid: must match [A-Za-z0-9._-]"}
     st = _current_state()
+    if (err := _require_registered(st)) is not None:
+        return err
     payload = json.dumps({"text": question, "from": st.sid})
     rid = create(
         f"[req] to {to_sid}: {question}"[:200],
@@ -710,6 +737,8 @@ def respond_info(request_id: str, answer: str) -> dict:
     """Answer an info-request (from poll_inbox 'requests'): comment + close,
     which unblocks the asking session."""
     st = _current_state()
+    if (err := _require_registered(st)) is not None:
+        return err
     run_bd("comment", request_id, answer, actor=st.sid)
     run_bd("close", request_id, actor=st.sid, check=False)
     return {"ok": True}
@@ -734,6 +763,8 @@ def delegate(to_sid: str, title: str, detail: str = "", priority: int = 2) -> di
     if not m.valid_token(to_sid):
         return {"ok": False, "error": "invalid to_sid: must match [A-Za-z0-9._-]"}
     st = _current_state()
+    if (err := _require_registered(st)) is not None:
+        return err
     # Re-read the leader slot on every call (not cached) to guard against a stale
     # leadership belief — e.g. this session lost leadership since it last checked.
     lead = L.read_leader(st.sid)

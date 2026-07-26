@@ -2,8 +2,23 @@
 
 from __future__ import annotations
 
+import pytest
+
 import claude_mailbox.model as m
 import claude_mailbox.server as srv
+
+
+@pytest.fixture(autouse=True)
+def _registered():
+    # read_channel is gated on registration (global-6ue); these tests exercise
+    # its sorting/validation logic directly, not the gate itself.
+    st = srv._current_state()
+    saved = st.bead_id
+    st.bead_id = "test-bead"
+    try:
+        yield
+    finally:
+        st.bead_id = saved
 
 
 def test_valid_token_accepts_safe_chars():

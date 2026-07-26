@@ -4,8 +4,23 @@ missing-bead robustness, mocked at the run_bd/create seam in server.py.
 
 from __future__ import annotations
 
+import pytest
+
 import claude_mailbox.server as srv
 from claude_mailbox.bd import BdError
+
+
+@pytest.fixture(autouse=True)
+def _registered():
+    # request_info/send_dm are gated on registration (global-6ue); these tests
+    # exercise their round-trip/error-handling logic, not the gate itself.
+    st = srv._current_state()
+    saved = st.bead_id
+    st.bead_id = "test-bead"
+    try:
+        yield
+    finally:
+        st.bead_id = saved
 
 
 def test_request_respond_round_trip(monkeypatch):
