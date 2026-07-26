@@ -122,6 +122,16 @@ def test_load_token_missing_returns_none(monkeypatch):
     assert srv._load_token() is None
 
 
+def test_load_token_empty_env_refuses(monkeypatch):
+    # An explicitly-set-but-empty MAILBOX_TOKEN is almost always a shell
+    # expansion bug (e.g. MAILBOX_TOKEN=$(cmd_that_failed)), not intentional
+    # opt-out — that's what leaving the var unset entirely means.
+    _no_token(monkeypatch)
+    monkeypatch.setenv("MAILBOX_TOKEN", "   ")
+    with pytest.raises(SystemExit):
+        srv._load_token()
+
+
 def test_load_token_empty_file_refuses(monkeypatch, tmp_path):
     # An empty token file is almost certainly a misconfiguration (operator
     # meant to set a token); treating it as "no token configured" would

@@ -76,8 +76,9 @@ Run it as a standalone HTTP service backed by its own local database:
 ```bash
 cd /path/to/claude-mailbox     # WORKSPACE — where the local .beads/ will live
 bd init --non-interactive      # one-time: creates the local embedded db
+export MAILBOX_TOKEN=$(openssl rand -hex 32)   # save this — the MCP client needs it too
 MAILBOX_TRANSPORT=http MAILBOX_HTTP_HOST=0.0.0.0 MAILBOX_HTTP_PORT=8000 \
-  MAILBOX_TOKEN=$(openssl rand -hex 32) MAILBOX_GLOBAL=0 uv run claude-mailbox
+  MAILBOX_GLOBAL=0 uv run claude-mailbox
 ```
 A non-loopback `MAILBOX_HTTP_HOST` (like `0.0.0.0` above) refuses to start
 without `MAILBOX_TOKEN`/`MAILBOX_TOKEN_FILE` set — any local (or LAN) process
@@ -128,8 +129,9 @@ docker volume create mailbox-data
 docker run --rm -v mailbox-data:/data --user mailbox \
   --entrypoint bd ghcr.io/<owner>/claude-mailbox:latest init --non-interactive
 
+export MAILBOX_TOKEN=$(openssl rand -hex 32)   # save this — the MCP client needs it too
 docker run -d --name claude-mailbox -p 8000:8000 \
-  -e MAILBOX_TOKEN=$(openssl rand -hex 32) \
+  -e MAILBOX_TOKEN \
   -v mailbox-data:/data ghcr.io/<owner>/claude-mailbox:latest
 ```
 

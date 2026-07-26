@@ -873,8 +873,10 @@ _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
 def _load_token() -> str | None:
-    token = os.environ.get("MAILBOX_TOKEN", "").strip()
-    if token:
+    if "MAILBOX_TOKEN" in os.environ:
+        token = os.environ["MAILBOX_TOKEN"].strip()
+        if not token:
+            raise SystemExit("MAILBOX_TOKEN is set but empty")
         return token
     path = os.environ.get("MAILBOX_TOKEN_FILE")
     if path:
