@@ -19,12 +19,14 @@ import atexit
 import json
 import logging
 import os
+import secrets
 import signal
 import sys
 import threading
 import time
 
 from fastmcp import Context, FastMCP
+from fastmcp.server.auth import AccessToken, TokenVerifier
 from fastmcp.server.dependencies import get_context
 
 from . import channel as ch
@@ -127,6 +129,20 @@ def _current_state() -> _SessionState:
     """Resolve the calling connection's per-session state. Every sync/async
     tool call goes through this instead of touching a shared global."""
     return _state_for(_resolve_conn_id())
+
+
+_NOT_REGISTERED = {"ok": False, "error": "not registered"}
+
+
+def _require_registered(st: _SessionState) -> dict | None:
+    """Single choke point (design: global-4pm P1): tools that act on behalf of
+    a session must not run on a connection that never called register_session
+    — otherwise gating register_session alone is security theater, since
+    _current_state() lazily mints a sid for anyone. Returns an error dict to
+    short-circuit the caller, or None if the connection is registered."""
+    if not st.bead_id:
+        return dict(_NOT_REGISTERED)
+    return None
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -498,8 +514,8 @@ def set_status(status: str) -> dict:
     if status not in ("active", "idle", "blocked", "done"):
         return {"ok": False, "error": "bad status"}
     st = _current_state()
-    if not st.bead_id:
-        return {"ok": False, "error": "not registered"}
+    if (err := _require_registered(st)) is not None:
+        return err
     run_bd(
         "set-state",
         st.bead_id,
@@ -531,8 +547,14 @@ def get_leader() -> dict:
 
 @mcp.tool
 def claim_leadership(force: bool = False) -> dict:
-    """Attempt to become leader. Only succeeds on the main branch unless force."""
+    """Attempt to become leader. Only succeeds on the main branch unless force.
+    force is restricted to stdio (global-tvr) — an HTTP caller force-claiming
+    leadership would gain delegate() over every session."""
     st = _current_state()
+    if (err := _require_registered(st)) is not None:
+        return err
+    if force and _http_mode():
+        return {"granted": False, "reason": "force requires stdio transport"}
     with st._lock:
         return L.claim(st.sid, st.git.branch, st.sid, force=force)
 
@@ -551,6 +573,8 @@ def broadcast(text: str, channel: str = "general") -> dict:
     if not m.valid_token(channel):
         return {"ok": False, "error": "invalid channel: must match [A-Za-z0-9._-]"}
     st = _current_state()
+    if (err := _require_registered(st)) is not None:
+        return err
     payload = json.dumps({"text": text, "from": st.sid, "channel": channel})
     mid = create(
         f"[msg] {channel}: {text}"[:200],
@@ -564,10 +588,12 @@ def broadcast(text: str, channel: str = "general") -> dict:
 
 
 @mcp.tool
-def read_channel(channel: str, limit: int = 20) -> list:
+def read_channel(channel: str, limit: int = 20) -> list | dict:
     """Read recent messages on a channel (newest first)."""
     if not m.valid_token(channel):
         return {"ok": False, "error": "invalid channel: must match [A-Za-z0-9._-]"}
+    if (err := _require_registered(_current_state())) is not None:
+        return err
     rows = (
         run_bd_json(
             "query", f"label={m.L_MESSAGE} AND label={m.channel_label(channel)}"
@@ -598,6 +624,8 @@ def send_dm(to_sid: str, text: str) -> dict:
     if not m.valid_token(to_sid):
         return {"ok": False, "error": "invalid to_sid: must match [A-Za-z0-9._-]"}
     st = _current_state()
+    if (err := _require_registered(st)) is not None:
+        return err
     payload = json.dumps({"text": text, "from": st.sid})
     mid = create(
         f"[dm] to {to_sid}: {text}"[:200],
@@ -644,7 +672,10 @@ def _poll_inbox(st: _SessionState, mark_read: bool = True) -> dict:
 def poll_inbox(mark_read: bool = True) -> dict:
     """Read messages/delegations addressed to this session. Closes DMs when
     mark_read is true (a closed DM = read)."""
-    return _poll_inbox(_current_state(), mark_read=mark_read)
+    st = _current_state()
+    if (err := _require_registered(st)) is not None:
+        return err
+    return _poll_inbox(st, mark_read=mark_read)
 
 
 def _bead_status(bead_id: str) -> str | None:
@@ -656,12 +687,36 @@ def _bead_status(bead_id: str) -> str | None:
     return bead.get("status") if isinstance(bead, dict) else None
 
 
+def _bead_assignee(bead_id: str) -> str | None:
+    try:
+        rows = run_bd_json("show", bead_id)
+    except BdError:
+        return None
+    bead = rows[0] if isinstance(rows, list) and rows else rows
+    return bead.get("assignee") if isinstance(bead, dict) else None
+
+
 def _last_answer(bead_id: str) -> str | None:
     try:
         comments = run_bd_json("comments", bead_id) or []
     except BdError:
         return None
     return comments[-1].get("text") if comments else None
+
+
+def _bead_from(bead_id: str) -> str | None:
+    try:
+        rows = run_bd_json("show", bead_id)
+    except BdError:
+        return None
+    bead = rows[0] if isinstance(rows, list) and rows else rows
+    if not isinstance(bead, dict):
+        return None
+    try:
+        meta = json.loads(bead.get("description") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return meta.get("from")
 
 
 @mcp.tool
@@ -677,6 +732,8 @@ def request_info(to_sid: str, question: str, timeout_s: int = 60) -> dict:
     if not m.valid_token(to_sid):
         return {"ok": False, "error": "invalid to_sid: must match [A-Za-z0-9._-]"}
     st = _current_state()
+    if (err := _require_registered(st)) is not None:
+        return err
     payload = json.dumps({"text": question, "from": st.sid})
     rid = create(
         f"[req] to {to_sid}: {question}"[:200],
@@ -706,8 +763,14 @@ def request_info(to_sid: str, question: str, timeout_s: int = 60) -> dict:
 @mcp.tool
 def respond_info(request_id: str, answer: str) -> dict:
     """Answer an info-request (from poll_inbox 'requests'): comment + close,
-    which unblocks the asking session."""
+    which unblocks the asking session. Only the session the request is
+    assigned to may answer it (global-5yn) — otherwise any connection could
+    forge an answer to another agent's blocking request_info call."""
     st = _current_state()
+    if (err := _require_registered(st)) is not None:
+        return err
+    if _bead_assignee(request_id) != st.sid:
+        return {"ok": False, "error": "request not assigned to you"}
     run_bd("comment", request_id, answer, actor=st.sid)
     run_bd("close", request_id, actor=st.sid, check=False)
     return {"ok": True}
@@ -715,7 +778,12 @@ def respond_info(request_id: str, answer: str) -> dict:
 
 @mcp.tool
 def check_request(request_id: str) -> dict:
-    """Non-blocking: has an info-request been answered yet?"""
+    """Non-blocking: has an info-request been answered yet? Only the session
+    that created the request may poll it — otherwise any connection could
+    read another agent's answer by guessing/enumerating request_ids."""
+    st = _current_state()
+    if _bead_from(request_id) != st.sid:
+        return {"resolved": False, "answer": None, "gone": True}
     status = _bead_status(request_id)
     if status is None:
         return {"resolved": False, "answer": None, "gone": True}
@@ -732,6 +800,8 @@ def delegate(to_sid: str, title: str, detail: str = "", priority: int = 2) -> di
     if not m.valid_token(to_sid):
         return {"ok": False, "error": "invalid to_sid: must match [A-Za-z0-9._-]"}
     st = _current_state()
+    if (err := _require_registered(st)) is not None:
+        return err
     # Re-read the leader slot on every call (not cached) to guard against a stale
     # leadership belief — e.g. this session lost leadership since it last checked.
     lead = L.read_leader(st.sid)
@@ -796,13 +866,69 @@ def _sig(_signum, _frame):
     sys.exit(0)
 
 
+# ── HTTP bearer-token auth (design: global-4pm P0) ──────────────────────────
+# stdio inherits the launching OS user's trust already, so it's exempt; HTTP
+# binds a TCP port any local (or LAN) process can reach, so it's gated.
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _load_token() -> str | None:
+    if "MAILBOX_TOKEN" in os.environ:
+        token = os.environ["MAILBOX_TOKEN"].strip()
+        if not token:
+            raise SystemExit("MAILBOX_TOKEN is set but empty")
+        return token
+    path = os.environ.get("MAILBOX_TOKEN_FILE")
+    if path:
+        with open(path) as f:
+            token = f.read().strip()
+        if not token:
+            raise SystemExit(f"MAILBOX_TOKEN_FILE={path!r} is empty")
+        return token
+    return None
+
+
+class _BearerTokenVerifier(TokenVerifier):
+    """Single shared deployment token, constant-time compare."""
+
+    def __init__(self, token: str) -> None:
+        super().__init__()
+        self._token = token.encode()
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        # compare as bytes: secrets.compare_digest rejects non-ASCII str input,
+        # which would otherwise turn a garbage bearer token into a 500 instead
+        # of a clean 401.
+        if not secrets.compare_digest(token.encode(), self._token):
+            return None
+        return AccessToken(token=token, client_id="mailbox", scopes=[])
+
+
 def main() -> None:
     signal.signal(signal.SIGTERM, _sig)
     signal.signal(signal.SIGINT, _sig)
     if os.environ.get("MAILBOX_TRANSPORT", "stdio") == "http":
+        host = os.environ.get("MAILBOX_HTTP_HOST", "127.0.0.1")
+        token = _load_token()
+        if not token and host not in _LOOPBACK_HOSTS:
+            raise SystemExit(
+                f"refusing to start: MAILBOX_HTTP_HOST={host!r} is not loopback and "
+                "no MAILBOX_TOKEN/MAILBOX_TOKEN_FILE is set — set one of them or bind "
+                "to 127.0.0.1"
+            )
+        if not token:
+            logger.warning(
+                "MAILBOX_TRANSPORT=http with no MAILBOX_TOKEN set — any local process "
+                "on this machine can reach the mailbox. Set MAILBOX_TOKEN before "
+                "relying on this beyond a trusted single-user machine."
+            )
+        # `auth` is a FastMCP constructor attribute, not a run()/run_http_async()
+        # kwarg — it must be set on the server object before run() builds the
+        # ASGI app, or HTTP auth is silently never enforced.
+        mcp.auth = _BearerTokenVerifier(token) if token else None
         mcp.run(
             transport="http",
-            host=os.environ.get("MAILBOX_HTTP_HOST", "127.0.0.1"),
+            host=host,
             port=int(os.environ.get("MAILBOX_HTTP_PORT", "8000")),
         )
     else:

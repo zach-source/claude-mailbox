@@ -4,8 +4,23 @@ missing-bead robustness, mocked at the run_bd/create seam in server.py.
 
 from __future__ import annotations
 
+import pytest
+
 import claude_mailbox.server as srv
 from claude_mailbox.bd import BdError
+
+
+@pytest.fixture(autouse=True)
+def _registered():
+    # request_info/send_dm are gated on registration (global-6ue); these tests
+    # exercise their round-trip/error-handling logic, not the gate itself.
+    st = srv._current_state()
+    saved = st.bead_id
+    st.bead_id = "test-bead"
+    try:
+        yield
+    finally:
+        st.bead_id = saved
 
 
 def test_request_respond_round_trip(monkeypatch):
@@ -40,10 +55,31 @@ def test_request_info_returns_error_when_assign_fails(monkeypatch):
 
 
 def test_check_request_missing_bead_returns_gone(monkeypatch):
+    monkeypatch.setattr(srv, "_bead_from", lambda bid: srv._current_state().sid)
     monkeypatch.setattr(srv, "_bead_status", lambda bid: None)
 
     result = srv.check_request(request_id="does-not-exist")
     assert result == {"resolved": False, "answer": None, "gone": True}
+
+
+def test_check_request_rejects_caller_who_is_not_the_asker(monkeypatch):
+    monkeypatch.setattr(srv, "_bead_from", lambda bid: "someone-else")
+    monkeypatch.setattr(
+        srv, "_bead_status", lambda bid: pytest.fail("must not be reached")
+    )
+
+    result = srv.check_request(request_id="req-1")
+    assert result == {"resolved": False, "answer": None, "gone": True}
+
+
+def test_check_request_allows_the_original_asker(monkeypatch):
+    st = srv._current_state()
+    monkeypatch.setattr(srv, "_bead_from", lambda bid: st.sid)
+    monkeypatch.setattr(srv, "_bead_status", lambda bid: "closed")
+    monkeypatch.setattr(srv, "_last_answer", lambda bid: "42")
+
+    result = srv.check_request(request_id="req-1")
+    assert result == {"resolved": True, "answer": "42"}
 
 
 def test_bead_status_swallows_bd_error(monkeypatch):
