@@ -22,8 +22,7 @@ class ClaudeMailbox < Formula
   #   curl -sL <url> | shasum -a 256
   url "https://github.com/zach-source/claude-mailbox/archive/refs/tags/v0.6.0.tar.gz"
   sha256 "10ae7c97ef30396a62d9013f7f5ebb205985b689d778b1253176fcc19f267561"
-  # No `license`: the repo ships no LICENSE file and declares none in
-  # pyproject.toml. Add one to both before submitting anywhere that requires it.
+  license "MIT"
   head "https://github.com/zach-source/claude-mailbox.git", branch: "main"
 
   # The server shells out to `bd` for all state, and to `git` to detect the

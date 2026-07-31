@@ -3,6 +3,8 @@ name = "claude-mailbox"
 version = "0.6.0"
 description = "MCP mailbox for cross-talk between concurrent Claude Code sessions, backed by beads (bd)"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = ["fastmcp>=3"]
 

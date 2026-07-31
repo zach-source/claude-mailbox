@@ -25,6 +25,8 @@ python3Packages.buildPythonApplication {
     fileset = lib.fileset.unions [
       ../pyproject.toml
       ../README.md
+      # pyproject's `license-files` makes hatchling require this at build time.
+      ../LICENSE
       ../src
       ../tests
     ];
@@ -73,9 +75,7 @@ python3Packages.buildPythonApplication {
   meta = {
     description = "MCP mailbox for cross-talk between concurrent Claude Code sessions";
     homepage = "https://github.com/zach-source/claude-mailbox";
-    # No `license`: the repo ships no LICENSE file and declares none in
-    # pyproject.toml, so there is nothing to assert here. Add one to both places
-    # if this is ever submitted to nixpkgs, which requires it.
+    license = lib.licenses.mit;
     mainProgram = "claude-mailbox";
     platforms = lib.platforms.unix;
   };
