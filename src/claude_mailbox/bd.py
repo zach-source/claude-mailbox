@@ -22,11 +22,31 @@ import shutil
 import subprocess
 from pathlib import Path
 
-# The mailbox repo root (…/claude-mailbox). Its .beads/ carries the shared-server
-# connection config. Override with MAILBOX_WORKSPACE for tests / relocation.
-WORKSPACE = os.environ.get(
-    "MAILBOX_WORKSPACE", str(Path(__file__).resolve().parents[2])
-)
+
+def _default_workspace() -> str:
+    """Where `bd -C` points when MAILBOX_WORKSPACE isn't set.
+
+    A source checkout keeps the historical answer: the repo root three levels up
+    from src/claude_mailbox/bd.py, whose `.beads/` carries the shared-server
+    connection config.
+
+    An *installed* build (nix, brew, plain pip) has no repo around it — there,
+    `parents[2]` resolves to something like `<prefix>/lib/python3.13`, which has
+    no `.beads/` and is typically read-only, so every `bd -C` call would target a
+    nonsense workspace. Those builds fall back to a per-user data directory
+    instead, giving the server one stable writable workspace no matter which
+    project directory the session runs in. Initialize it once with `bd init`
+    (see the README's install sections).
+    """
+    repo = Path(__file__).resolve().parents[2]
+    if (repo / ".beads").is_dir():
+        return str(repo)
+    xdg = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return str(Path(xdg) / "claude-mailbox")
+
+
+# Override with MAILBOX_WORKSPACE for tests / relocation / packaging.
+WORKSPACE = os.environ.get("MAILBOX_WORKSPACE") or _default_workspace()
 
 BD = shutil.which("bd") or "bd"
 

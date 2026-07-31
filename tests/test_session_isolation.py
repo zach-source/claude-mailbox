@@ -296,6 +296,20 @@ def test_heartbeats_do_not_grow_the_database(fake_bd, monkeypatch):
     monkeypatch.setattr(srv, "run_bd", recording)
     monkeypatch.setattr(L, "run_bd", recording)
 
+    # Pin the git context. This test asserts the *leader* write pattern — two
+    # description writes a beat, the session bead's hb and the leader slot's
+    # leader_hb — and leadership is derived from the branch. Reading the ambient
+    # branch meant it only held on a checkout that happened to be on main, and
+    # collapsed to one write a beat anywhere git is absent (a nix/CI sandbox),
+    # asserting nothing about the bloat it exists to guard.
+    monkeypatch.setattr(
+        srv,
+        "detect_git",
+        lambda *a, **k: srv.GitContext(
+            project="mailbox", branch=m.LEADER_BRANCH, worktree="/tmp/mailbox"
+        ),
+    )
+
     st = srv._state_for("conn-hb")
     srv._register_impl(st, "measure the beat")
     calls.clear()  # registration is one-off; only the steady state is unbounded

@@ -14,3 +14,7 @@ uv.lock
 .dolt/
 *.db
 .beads-credential-key
+
+# nix build output symlink
+result
+result-*

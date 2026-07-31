@@ -27,25 +27,69 @@ skills/        # `mailbox` + `mailbox-leader` Claude skills
 docs/DESIGN.md # full design (data model, protocol, risks)
 ```
 
-The server resolves its `bd` workspace from the repo itself, via
-`WORKSPACE = Path(__file__).parents[2]` in `bd.py` — overridable with the
-`MAILBOX_WORKSPACE` env var. This is why the invocation below runs it with
-`uv run --project <repo>`; a bare wheel install (no repo checkout alongside
-it) would need `MAILBOX_WORKSPACE` set explicitly.
+The server needs a `bd` **workspace** (a directory with a `.beads/`) to resolve
+the shared-server connection, and passes it as `bd -C <workspace>` on every call
+so the mailbox is reachable from any cwd. `bd.py` picks one automatically:
 
-## Run
+| How you got it | Workspace |
+|---|---|
+| Source checkout | the repo root (its own `.beads/`) |
+| Installed build (nix, brew, pip) | `$XDG_DATA_HOME/claude-mailbox`, i.e. `~/.local/share/claude-mailbox` |
+
+`MAILBOX_WORKSPACE` overrides both.
+
+## Install
+
+Every route needs `bd` ([beads](https://github.com/gastownhall/beads)) on PATH
+and the machine-wide database created **once**:
+
+```bash
+bd init --global               # creates/initializes beads_global on the shared dolt server
+```
+
+### Nix
+```bash
+nix run github:zach-source/claude-mailbox              # run the MCP server (stdio)
+nix run github:zach-source/claude-mailbox#mailbox -- who
+nix profile install github:zach-source/claude-mailbox  # or install it
+```
+The wrapper appends its own `beads` and `git` to PATH as a *suffix*, so a `bd`
+you already have keeps winning — mailbox state lives in a shared database that
+carries schema migrations, and forcing a different `bd` version at it risks
+schema skew. Build with `preferSystemBd = false` to pin the packaged one.
+
+A `devShell` (`nix develop`) provides `uv`, `python3`, `beads`, and `git`.
+
+### Homebrew
+```bash
+brew tap zach-source/claude-mailbox https://github.com/zach-source/claude-mailbox
+brew install zach-source/claude-mailbox/claude-mailbox
+```
+Pulls in `beads` as a dependency. It's a tap formula, not homebrew-core: it
+resolves its ~69 Python dependencies from PyPI at install time rather than
+vendoring each as a pinned `resource` (see the note atop `Formula/claude-mailbox.rb`).
+
+### From a checkout
 ```bash
 uv run claude-mailbox          # start the MCP server (stdio)
 uv run mailbox who             # list live sessions (CLI, no agent)
 ```
 
-Prereq: the global mailbox DB must exist once per machine:
+### Initialize the workspace (installed builds only)
+A checkout already has one. An installed build needs it once:
 ```bash
-bd init --global               # creates/initializes beads_global on the shared dolt server
+mkdir -p ~/.local/share/claude-mailbox
+bd init -C ~/.local/share/claude-mailbox
 ```
+`mailbox who` tells you this, with the exact commands, if you skip it.
 
 ## Wire into Claude Code / codex
 Add to `~/.claude/mcp_servers.json` (and it mirrors to codex):
+```json
+"mailbox": { "command": "claude-mailbox" }
+```
+Installed via nix or brew, the bare command is enough. From a checkout, point
+`uv` at it instead:
 ```json
 "mailbox": { "command": "uv", "args": ["run", "--project",
   "/path/to/claude-mailbox", "claude-mailbox"] }

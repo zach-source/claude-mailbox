@@ -11,10 +11,11 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
 from . import leader as L
 from . import model as m
-from .bd import create, run_bd, run_bd_json
+from .bd import WORKSPACE, BdError, create, run_bd, run_bd_json
 from .identity import hostname
 
 
@@ -92,7 +93,23 @@ def main(argv=None) -> int:
     inb.set_defaults(fn=_inbox)
 
     args = p.parse_args(argv)
-    return args.fn(args)
+    try:
+        return args.fn(args)
+    except BdError as exc:
+        # An installed build (nix/brew) resolves its workspace per-user, and the
+        # very first command a fresh install runs hits a workspace that hasn't
+        # been `bd init`ed yet. That used to surface as a raw traceback; say what
+        # to do instead. The underlying bd error is kept — it's the useful part.
+        print(f"error: bd failed\n{exc}", file=sys.stderr)
+        if not Path(WORKSPACE, ".beads").is_dir():
+            print(
+                f"\nThe mailbox workspace {WORKSPACE!r} is not initialized. Once:\n"
+                f"  mkdir -p {WORKSPACE} && bd init -C {WORKSPACE}\n"
+                f"  bd init --global\n"
+                f"Or point at an existing one with MAILBOX_WORKSPACE.",
+                file=sys.stderr,
+            )
+        return 1
 
 
 if __name__ == "__main__":
