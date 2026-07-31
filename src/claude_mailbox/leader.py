@@ -89,7 +89,12 @@ def ensure_slot(actor: str) -> str:
 
 
 def read_leader(actor: str) -> dict:
-    slot = _find_slot()
+    return _leader_view(_find_slot())
+
+
+def _leader_view(slot: dict | None) -> dict:
+    """Interpret an already-fetched slot bead. Split out from read_leader so a
+    caller holding the slot (heartbeat_leader) can avoid re-querying for it."""
     if not slot:
         return {"vacant": True, "leader_sid": None, "branch": None, "stale": True}
     st = states_of(slot)
@@ -173,11 +178,21 @@ def _refresh(bid: str, sid: str, branch: str, actor: str):
 def heartbeat_leader(sid: str, branch: str, actor: str) -> dict:
     """Called each heartbeat by a session. Maintains or (re)acquires leadership
     when on main; yields it when off main."""
-    cur = read_leader(actor)
+    # One slot read per beat. This used to call read_leader() and then
+    # ensure_slot(), which issued a second *and* third identical
+    # `query label=mailbox:leader-slot` just to rediscover the bead already in
+    # hand — three subprocesses per beat, per session, to refresh one timestamp.
+    #
+    # Dropping ensure_slot() here also drops its duplicate-slot self-heal from
+    # the refresh path. That's safe: duplicates can only be minted by a create
+    # race inside ensure_slot itself, which `claim` still calls on every
+    # acquisition, and _find_slot's min-id rule means every reader agrees on the
+    # same slot meanwhile. Refreshing an existing lease can't create one.
+    slot = _find_slot()
+    cur = _leader_view(slot)
     if branch == m.LEADER_BRANCH:
-        if cur["leader_sid"] == sid:
-            bid = ensure_slot(actor)
-            _refresh(bid, sid, branch, actor)
+        if slot and cur["leader_sid"] == sid:
+            _refresh(slot["id"], sid, branch, actor)
             return {"role": "leader", **cur, "leader_sid": sid}
         if cur["vacant"] or cur["stale"]:
             return {

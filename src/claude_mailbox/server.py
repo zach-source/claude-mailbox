@@ -54,8 +54,27 @@ mcp = FastMCP("claude-mailbox", instructions=_CHANNEL_INSTRUCTIONS)
 ch.enable_channel(mcp)
 
 # How often the channel-delivery thread checks for new inbound to push (seconds).
-# Faster than the HB_BUCKET heartbeat so peer messages feel like interrupts.
-CHANNEL_POLL_SECONDS = 4
+# Faster than the HB_BUCKET heartbeat so peer messages feel like interrupts, but
+# every poll costs a `bd` subprocess (~0.3s of Go startup before any DB work,
+# and a machine-wide schema-migration lock), and a busy machine runs one server
+# per agent session — measured 20 concurrent on one laptop. At the old flat 4s
+# with one query per subscribed channel that was ~1 spawn/sec/session in
+# perpetuity, enough to saturate the shared Dolt server. Now: one query per poll
+# (see _inbound_query) on an idle backoff, so a quiet mailbox costs a spawn a
+# minute and a busy one still reacts within CHANNEL_POLL_SECONDS.
+CHANNEL_POLL_SECONDS = 15
+CHANNEL_POLL_MAX_SECONDS = 60
+
+# Bounds on the single inbound query. The lookback exists because `bd query`
+# silently defaults to `--limit 50`: an unbounded scan of a channel's whole
+# history meant a busy channel could hide its newest messages behind 50 older
+# rows forever, so this is a correctness bound as much as a cost one.
+_INBOUND_LOOKBACK = "1h"  # bd relative-duration syntax
+_INBOUND_LIMIT = 200
+
+# Cap on the per-connection delivered-ids set. These processes live for weeks;
+# the set used to be unbounded and kept every id ever seen.
+_SEEN_MAX = 2000
 
 
 class _SessionState:
@@ -69,15 +88,31 @@ class _SessionState:
         self.bead_id: str | None = None
         self.meta: dict = {}
         self.channel: ch.ChannelState | None = None  # captured per-connection
-        self._seen: set[str] = (
-            set()
-        )  # message bead ids already pushed to this connection
+        # Message bead ids already pushed to this connection. A dict used as an
+        # insertion-ordered set so the oldest can be evicted — see mark_seen.
+        self._seen: dict[str, None] = {}
         self._lock = threading.Lock()
         self.last_activity = time.time()  # last real tool call from this connection
         self.role: str | None = None  # last role written; skips no-op set-state beats
 
     def subscribed_channels(self) -> list[str]:
-        return ["general", f"{self.git.project}", "leader"]
+        # Filtered through valid_token because these names are interpolated into
+        # a single compound bd query (_inbound_query): one malformed name — a
+        # repo directory with a space in it, say — would otherwise break
+        # delivery for every channel at once, not just its own.
+        return [c for c in ("general", self.git.project, "leader") if m.valid_token(c)]
+
+    def has_seen(self, rid: str) -> bool:
+        return rid in self._seen
+
+    def mark_seen(self, rid: str) -> None:
+        """Record a delivered id, evicting the oldest past _SEEN_MAX. Safe to
+        forget old ids because the inbound query is lookback-bounded, so a
+        re-push would need a bead both older than the window and still
+        unseen."""
+        self._seen[rid] = None
+        while len(self._seen) > _SEEN_MAX:
+            self._seen.pop(next(iter(self._seen)))
 
 
 # ── per-connection session registry ─────────────────────────────────────────
@@ -274,90 +309,113 @@ def _reap_stale(actor_sid: str) -> None:
 
 
 def _channel_loop() -> None:
-    while not _stop.wait(CHANNEL_POLL_SECONDS):
-        try:
-            for st in list(_SESSIONS.values()):
-                _deliver_channel(st)
-        except Exception as exc:  # keep the daemon alive on transient bd errors
-            logger.warning("channel delivery failed: %s", exc)
+    delay = CHANNEL_POLL_SECONDS
+    while not _stop.wait(delay):
+        pushed = 0
+        for st in list(_SESSIONS.values()):
+            # Per session, not around the whole sweep: `run_bd` raises on a 30s
+            # subprocess timeout, and a single wrapping try meant one slow bd
+            # call aborted delivery for every *other* session in that pass.
+            try:
+                pushed += _deliver_channel(st)
+            except Exception as exc:  # keep the daemon alive on transient errors
+                logger.warning("channel delivery failed for %s: %s", st.sid, exc)
+        # Back off while nothing is moving; snap back the moment traffic appears.
+        delay = (
+            CHANNEL_POLL_SECONDS if pushed else min(delay * 2, CHANNEL_POLL_MAX_SECONDS)
+        )
+
+
+def _inbound_query(st: _SessionState) -> str:
+    """The single bd expression the channel poller runs.
+
+    Covers both halves of a session's inbound in one subprocess: items assigned
+    to us (DMs, info-requests, delegations) and recent broadcasts on subscribed
+    channels. This used to be `1 + len(subscribed_channels)` separate `bd`
+    spawns per poll.
+
+    The broadcast half is bounded by `created>` so the scan doesn't grow with a
+    channel's whole history — and because `bd query` silently defaults to
+    `--limit 50`, that bound is what keeps new messages from hiding behind 50
+    older rows. Tradeoff: a process suspended longer than the lookback (laptop
+    sleep) can miss a broadcast on resume; poll_inbox/read_channel still surface
+    it on demand.
+    """
+    mine = f"assignee={st.sid} AND status=open"
+    chans = " OR ".join(f"label={m.channel_label(c)}" for c in st.subscribed_channels())
+    if not chans:
+        return mine
+    return (
+        f"({mine}) OR "
+        f"(label={m.L_MESSAGE} AND ({chans}) AND created>{_INBOUND_LOOKBACK})"
+    )
+
+
+def _fetch_inbound(st: _SessionState) -> list[dict]:
+    return run_bd_json("query", _inbound_query(st), "-n", str(_INBOUND_LIMIT)) or []
+
+
+def _kind_of(st: _SessionState, row: dict, labels: list[str]) -> str | None:
+    """Classify a row from _inbound_query, or None if it isn't deliverable."""
+    if row.get("assignee") == st.sid:
+        if m.L_REQUEST in labels:
+            return "request"
+        if m.L_DELEGATION in labels:
+            return "delegation"
+        return "dm" if m.L_DM in labels else None
+    return "broadcast" if m.L_MESSAGE in labels else None
 
 
 def _seed_seen(st: _SessionState) -> None:
-    """Mark all currently-present inbound + subscribed-channel messages as already
-    delivered, so the channel pushes only messages that arrive AFTER we join (no
-    startup backlog flood). The pull tools still surface any pre-existing items."""
-    for r in run_bd_json("query", f"assignee={st.sid} AND status=open") or []:
-        st._seen.add(r["id"])
-    for chan in st.subscribed_channels():
-        q = f"label={m.L_MESSAGE} AND label={m.channel_label(chan)}"
-        for r in run_bd_json("query", q) or []:
-            st._seen.add(r["id"])
+    """Mark everything the poller can currently see as already delivered, so the
+    channel pushes only messages that arrive AFTER we join (no startup backlog
+    flood). The pull tools still surface any pre-existing items.
+
+    Runs the *same* query as _deliver_channel so seeding and delivery can never
+    disagree about what "currently present" means — they used to issue different
+    queries, and with bd's implicit --limit 50 that let a busy channel under-seed
+    and then flood on the first pass.
+    """
+    for r in _fetch_inbound(st):
+        if r.get("id"):
+            st.mark_seen(r["id"])
 
 
-def _deliver_channel(st: _SessionState) -> None:
+def _deliver_channel(st: _SessionState) -> int:
     """Push new inbound to the session as claude/channel events. Delivery-once via
     st._seen. DMs are closed after push (delivered = read); requests stay open so
-    the model can respond_info to them."""
+    the model can respond_info to them. Returns the number pushed."""
     if not st.bead_id or not ch.is_live(st.channel):
-        return
-    # 1. items addressed to us: DMs, info-requests, delegations
-    for r in run_bd_json("query", f"assignee={st.sid} AND status=open") or []:
-        rid = r["id"]
-        if rid in st._seen:
+        return 0
+    pushed = 0
+    for r in _fetch_inbound(st):
+        rid = r.get("id")
+        if not rid or st.has_seen(rid):
             continue
         labels = r.get("labels") or []
-        try:
-            meta = json.loads(r.get("description") or "{}")
-        except (json.JSONDecodeError, TypeError):
-            meta = {}
-        if m.L_REQUEST in labels:
-            kind = "request"
-        elif m.L_DELEGATION in labels:
-            kind = "delegation"
-        elif m.L_DM in labels:
-            kind = "dm"
-        else:
+        if m.from_label(st.sid) in labels:
+            st.mark_seen(rid)  # our own broadcast — don't echo it back to us
             continue
-        text = meta.get("text") or r.get("title") or ""
-        pushed = ch.push(
+        kind = _kind_of(st, r, labels)
+        if kind is None:
+            continue
+        meta = m.meta_of(r)
+        if ch.push(
             st.channel,
-            text,
+            meta.get("text") or r.get("title") or "",
             {
                 "kind": kind,
                 "from_sid": meta.get("from"),
+                "channel": meta.get("channel") if kind == "broadcast" else None,
                 "request_id": rid if kind == "request" else None,
                 "bead_id": rid,
             },
-        )
-        if pushed:
-            st._seen.add(rid)
+        ):
+            st.mark_seen(rid)
+            pushed += 1
             if kind == "dm":
                 run_bd("close", rid, actor=st.sid, check=False)
-    # 2. broadcasts on our subscribed channels (skip our own)
-    for chan in st.subscribed_channels():
-        q = f"label={m.L_MESSAGE} AND label={m.channel_label(chan)}"
-        for r in run_bd_json("query", q) or []:
-            rid = r["id"]
-            if rid in st._seen:
-                continue
-            if m.from_label(st.sid) in (r.get("labels") or []):
-                st._seen.add(rid)  # our own broadcast — don't echo it back to us
-                continue
-            try:
-                meta = json.loads(r.get("description") or "{}")
-            except (json.JSONDecodeError, TypeError):
-                meta = {}
-            if ch.push(
-                st.channel,
-                meta.get("text") or r.get("title") or "",
-                {
-                    "kind": "broadcast",
-                    "channel": chan,
-                    "from_sid": meta.get("from"),
-                    "bead_id": rid,
-                },
-            ):
-                st._seen.add(rid)
+    return pushed
 
 
 def _ensure_background_threads() -> None:
@@ -532,7 +590,10 @@ def list_sessions(include_stale: bool = False, project: str | None = None) -> li
     q = f"label={m.L_SESSION} AND status=open"
     if project:
         q += f" AND label=project:{project}"
-    out = [_session_view(r) for r in (run_bd_json("query", q) or [])]
+    # Explicit -n: bd's default is --limit 50, and a busy machine really does run
+    # dozens of sessions (measured 20 concurrent), so the default would silently
+    # truncate the roster.
+    out = [_session_view(r) for r in (run_bd_json("query", q, "-n", "200") or [])]
     return [v for v in out if include_stale or not v["stale"]]
 
 
@@ -591,9 +652,19 @@ def read_channel(channel: str, limit: int = 20) -> list | dict:
         return {"ok": False, "error": "invalid channel: must match [A-Za-z0-9._-]"}
     if (err := _require_registered(_current_state())) is not None:
         return err
+    # Sort and limit in bd, not just in Python: bd's default --limit 50 meant we
+    # were sorting whichever arbitrary 50 rows it happened to return, so on a
+    # channel with more than 50 messages "newest first" could miss the newest.
+    # The Python sort stays as a deterministic tiebreak over the rows we get.
     rows = (
         run_bd_json(
-            "query", f"label={m.L_MESSAGE} AND label={m.channel_label(channel)}"
+            "query",
+            f"label={m.L_MESSAGE} AND label={m.channel_label(channel)}",
+            "--sort",
+            "created",
+            "-r",
+            "-n",
+            str(max(1, limit)),
         )
         or []
     )
@@ -640,7 +711,7 @@ def send_dm(to_sid: str, text: str) -> dict:
 
 
 def _poll_inbox(st: _SessionState, mark_read: bool = True) -> dict:
-    rows = run_bd_json("query", f"assignee={st.sid} AND status=open") or []
+    rows = run_bd_json("query", f"assignee={st.sid} AND status=open", "-n", "200") or []
     dms, delegations, requests = [], [], []
     for r in rows:
         labels = r.get("labels") or []
@@ -745,8 +816,16 @@ def request_info(to_sid: str, question: str, timeout_s: int = 60) -> dict:
     except BdError as e:
         return {"request_id": rid, "resolved": False, "error": f"assign failed: {e}"}
     deadline = time.time() + max(0, timeout_s)
-    while time.time() < deadline:
-        time.sleep(3)
+    # Exponential backoff rather than a flat 3s: every probe is a fresh `bd show`
+    # subprocess (~0.3s of Go startup before it even opens the DB), so a 60s
+    # request cost ~20 spawns while blocking. Starts tighter than the old 3s, so
+    # a fast answer is actually noticed sooner, then decays.
+    delay = 1.0
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(delay, remaining))
         if _bead_status(rid) == "closed":
             return {
                 "request_id": rid,
@@ -754,6 +833,7 @@ def request_info(to_sid: str, question: str, timeout_s: int = 60) -> dict:
                 "resolved": True,
                 "timed_out": False,
             }
+        delay = min(delay * 1.7, 15.0)
     return {"request_id": rid, "answer": None, "resolved": False, "timed_out": True}
 
 

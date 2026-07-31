@@ -70,7 +70,54 @@ several concurrent connections, each with its own sid/git-context/bead_id/
 objective/captured channel session. One shared heartbeat thread and one shared
 channel-delivery thread iterate every tracked connection each tick — not one
 thread pair per connection — since a periodic sweep over a dict is simpler
-than per-connection thread lifecycle management and equally correct.
+than per-connection thread lifecycle management and equally correct. What those
+two threads are allowed to cost is §6.
+
+## 6. Poll cost budget
+The server's steady-state cost is *entirely* background polling, and it is paid
+in `bd` subprocesses. One server runs per agent session, and a busy machine
+really does run many — 20 concurrent were measured on one laptop, all sharing
+one Dolt server. So the per-session budget is multiplied by session count, and
+it has to stay small.
+
+Measured `bd` calls (see `tests/test_channel_delivery.py`, which pins the
+channel figure):
+
+| Path | Before | Now |
+|---|---|---|
+| Channel poll | 4 (`1 + len(subscribed_channels)`) | **1** |
+| Heartbeat tick | 5 | **3** |
+| Poll interval | flat 4s | 15s, backing off to 60s while idle |
+| Sustained, per session | ~1.08 calls/s | **~0.07 calls/s idle, ~0.12 busy** |
+
+At 20 sessions that is ~22 calls/s → ~1.4 calls/s. The old figure was enough to
+saturate the shared Dolt server: `bd query` against `beads_global` was measured
+at 33–146s per call under that load, all of it queueing on the schema-migration
+lock, with the server pinned at ~140% CPU.
+
+Three rules hold the budget:
+1. **One query per poll.** `_inbound_query` covers the assigned-to-us inbox and
+   every subscribed channel in a single expression using bd's `OR`/paren
+   grouping. Channel names are `valid_token`-filtered before interpolation —
+   with one shared expression, a single malformed name would break delivery for
+   every channel at once rather than just its own.
+2. **Every query is explicitly bounded.** `bd query` silently defaults to
+   `--limit 50`. That default was a *correctness* bug, not just a cost one: an
+   unbounded channel scan meant new messages could hide behind 50 older rows
+   forever, and `read_channel` was sorting whichever arbitrary 50 rows came
+   back. Broadcasts are additionally bounded by `created>` so the scan doesn't
+   grow with channel history. Tradeoff: a process suspended past the lookback
+   (laptop sleep) can miss a broadcast on resume; the pull tools still surface
+   it.
+3. **Idle costs less than busy.** The delivery loop backs off to
+   `CHANNEL_POLL_MAX_SECONDS` when a pass pushes nothing and snaps back to
+   `CHANNEL_POLL_SECONDS` the moment traffic appears. Most sessions are idle
+   most of the time.
+
+Failure isolation belongs here too: the delivery sweep catches per session, not
+around the whole loop. `run_bd` raises on its 30s subprocess timeout, and at the
+latencies above that fires routinely — a single wrapping `try` meant one slow
+session aborted delivery for every other session in the same pass.
 
 ## bd integration notes (verified — differ from the first-draft design)
 1. **`bd --global` needs a local `.beads/` workspace** for the shared-server
@@ -102,9 +149,21 @@ than per-connection thread lifecycle management and equally correct.
   periodic sync; leave as a user decision.
 - **Identity is unauthenticated** (`--actor`/sid are self-asserted) — fine for a
   single-user fleet; no auth.
-- **Query volume**: ~2 bd calls/min/session (heartbeat + inbox). Fine <20 sessions.
-  Write *volume* matters more than call count: keep steady-state writes off
-  `set-state` and on `--no-history` beads, or the DB grows without bound.
+- **Query volume** — see §6; the original "~2 bd calls/min/session, fine <20
+  sessions" estimate was wrong by ~30×, and the correction is now a budget with
+  a regression test rather than an estimate. Write *volume* still matters more
+  than call count: keep steady-state writes off `set-state` and on
+  `--no-history` beads, or the DB grows without bound.
+- **`bd` subprocess is the read transport, and it's the standing cost ceiling.**
+  Every read pays ~0.3s of Go startup (measured, `bd version`, before any DB
+  work) plus a DB open plus a machine-wide schema-migration lock that serializes
+  across *all* bd processes. §6's budget keeps that affordable; it doesn't make
+  it cheap. The escape hatch, if the budget stops holding, is a persistent
+  MySQL connection to the Dolt sql-server for reads (~1–5ms, measured 0.7s for
+  a whole `dolt sql` client round-trip including spawn), keeping `bd` for
+  writes where the audit trail and wisp semantics are the point. That trades
+  the "never touch Dolt directly" rule in §5 for coupling to beads' table
+  layout — deliberately not taken yet.
 - **Blocking `request_info`** would hold a model turn up to its timeout; prefer an
   async `check_request` escape hatch when implemented.
 - **register via SessionStart hook** (guaranteed) vs skill (probabilistic):

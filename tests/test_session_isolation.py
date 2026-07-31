@@ -95,23 +95,61 @@ class FakeBd:
             return []
         raise NotImplementedError(f"fake bd: unsupported json command {cmd!r}")
 
+    # bd's query grammar is AND/OR with parenthesised grouping; the channel
+    # poller now issues one compound expression instead of N flat ones
+    # (server._inbound_query), so a flat " AND "-splitting fake would silently
+    # match nothing and hide real behavior behind green tests.
+    @classmethod
+    def _matches(cls, bead: dict, expr: str) -> bool:
+        expr = expr.strip()
+        if expr.startswith("(") and cls._is_wrapped(expr):
+            return cls._matches(bead, expr[1:-1])
+        for op, combine in ((" OR ", any), (" AND ", all)):
+            parts = cls._split_top(expr, op)
+            if len(parts) > 1:
+                return combine(cls._matches(bead, p) for p in parts)
+        return cls._leaf(bead, expr)
+
     @staticmethod
-    def _matches(bead: dict, expr: str) -> bool:
-        for clause in expr.split(" AND "):
-            field, _, val = clause.partition("=")
-            field, val = field.strip(), val.strip()
-            if field == "label":
-                if val not in bead["labels"]:
-                    return False
-            elif field == "status":
-                if bead["status"] != val:
-                    return False
-            elif field == "assignee":
-                if bead.get("assignee") != val:
-                    return False
-            else:
-                return False
-        return True
+    def _is_wrapped(expr: str) -> bool:
+        """True if the leading '(' closes only at the very end."""
+        depth = 0
+        for i, chunk in enumerate(expr):
+            depth += (chunk == "(") - (chunk == ")")
+            if depth == 0:
+                return i == len(expr) - 1
+        return False
+
+    @staticmethod
+    def _split_top(expr: str, op: str) -> list[str]:
+        """Split on `op` only at paren depth 0."""
+        parts, depth, start = [], 0, 0
+        i = 0
+        while i < len(expr):
+            depth += (expr[i] == "(") - (expr[i] == ")")
+            if depth == 0 and expr.startswith(op, i):
+                parts.append(expr[start:i])
+                i += len(op)
+                start = i
+                continue
+            i += 1
+        parts.append(expr[start:])
+        return parts
+
+    @staticmethod
+    def _leaf(bead: dict, clause: str) -> bool:
+        clause = clause.strip()
+        if clause.startswith("created>"):
+            return True  # fake beads carry a fixed created_at; lookback always hits
+        field, _, val = clause.partition("=")
+        field, val = field.strip(), val.strip()
+        if field == "label":
+            return val in bead["labels"]
+        if field == "status":
+            return bead["status"] == val
+        if field == "assignee":
+            return bead.get("assignee") == val
+        return False
 
 
 @pytest.fixture
