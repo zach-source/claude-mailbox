@@ -41,8 +41,9 @@ def test_claim_leadership_force_allowed_over_stdio(monkeypatch):
     monkeypatch.setattr(
         srv.L,
         "claim",
-        lambda sid, branch, actor, force=False: calls.append(force)
-        or {"granted": True, "reason": "leader"},
+        lambda sid, branch, actor, force=False: (
+            calls.append(force) or {"granted": True, "reason": "leader"}
+        ),
     )
 
     result = srv.claim_leadership(force=True)
@@ -57,8 +58,9 @@ def test_claim_leadership_non_force_allowed_over_http(monkeypatch):
     monkeypatch.setattr(
         srv.L,
         "claim",
-        lambda sid, branch, actor, force=False: calls.append(force)
-        or {"granted": False, "reason": "not on main"},
+        lambda sid, branch, actor, force=False: (
+            calls.append(force) or {"granted": False, "reason": "not on main"}
+        ),
     )
 
     result = srv.claim_leadership(force=False)

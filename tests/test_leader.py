@@ -48,7 +48,7 @@ class FakeBdStore:
     def set_state(self, bid: str, dim_val: str) -> None:
         bead = self.beads[bid]
         dim, _, _val = dim_val.partition("=")
-        bead["labels"] = [l for l in bead["labels"] if not l.startswith(f"{dim}:")]
+        bead["labels"] = [x for x in bead["labels"] if not x.startswith(f"{dim}:")]
         bead["labels"].append(dim_val.replace("=", ":", 1))
 
     def close(self, bid: str) -> None:

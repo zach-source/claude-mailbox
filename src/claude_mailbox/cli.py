@@ -15,7 +15,7 @@ import sys
 from . import leader as L
 from . import model as m
 from .bd import create, run_bd, run_bd_json
-from .identity import detect_git, hostname, new_sid
+from .identity import hostname
 
 
 def _who(_args) -> int:
@@ -31,9 +31,9 @@ def _who(_args) -> int:
         except (json.JSONDecodeError, TypeError):
             meta = {}
         print(
-            f"{st.get(m.D_ROLE,'?'):9} {st.get(m.D_STATUS,'?'):8} "
-            f"{meta.get('project','?')}@{meta.get('branch','?')}  "
-            f"{meta.get('objective','')}  ({meta.get('sid','?')})"
+            f"{st.get(m.D_ROLE, '?'):9} {st.get(m.D_STATUS, '?'):8} "
+            f"{meta.get('project', '?')}@{meta.get('branch', '?')}  "
+            f"{meta.get('objective', '')}  ({meta.get('sid', '?')})"
         )
     return 0
 
@@ -68,7 +68,7 @@ def _inbox(args) -> int:
         return 2
     rows = run_bd_json("query", f"assignee={sid} AND status=open") or []
     for r in rows:
-        print(f"{r['id']}  {r.get('title','')}")
+        print(f"{r['id']}  {r.get('title', '')}")
         if args.ack and m.L_DM in (r.get("labels") or []):
             run_bd("close", r["id"], actor=sid, check=False)
     return 0
