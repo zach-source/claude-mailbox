@@ -9,6 +9,7 @@ Run: `uv run pytest` (or `pytest tests/`).
 from __future__ import annotations
 
 import itertools
+import json
 
 import pytest
 
@@ -54,8 +55,21 @@ class FakeBdStore:
         if bid in self.beads:
             self.beads[bid]["status"] = "closed"
 
+    def update(self, bid: str, args: tuple) -> None:
+        """`bd update <id> [-d <json>] [--no-history]` — the heartbeat write path.
+        Heartbeats are description JSON, not state labels (see model.K_LEADER_HB),
+        so the fake must model the description to exercise leader staleness."""
+        bead = self.beads[bid]
+        if "-d" in args:
+            bead["description"] = args[args.index("-d") + 1]
+        if "--no-history" in args:
+            bead["no_history"] = True
+
     def run_bd(self, *args, actor=None, check=True):
         cmd = args[0]
+        if cmd == "update":
+            self.update(args[1], args)
+            return ""
         if cmd == "q":
             title = args[1]
             labels = args[args.index("-l") + 1].split(",") if "-l" in args else []
@@ -100,9 +114,23 @@ def test_states_of_parses_dimension_labels():
     st = L.states_of(bead)
     assert st["status"] == "blocked"
     assert st["role"] == "leader"
-    assert st["hb"] == "42"
-    # non-state x:y labels (session:, channel:) are ignored
-    assert "session" not in st and "channel" not in st
+    # non-state x:y labels (session:, channel:) are ignored — and so is a legacy
+    # `hb:` label: heartbeats moved out of set-state into the description JSON,
+    # so stale hb labels left on old beads must not be read back as state.
+    assert "session" not in st and "channel" not in st and "hb" not in st
+
+
+def test_heartbeat_is_description_json_not_a_state_label(store):
+    """Regression guard for the bloat fix: a leader heartbeat must not create a
+    `leader-hb:<epoch>` label (every such write costs ~3.8 Dolt commits plus an
+    event bead — that churn grew to 99% of beads_global)."""
+    L.claim("h-1-aaa", branch="main", actor="h-1-aaa")
+    slot = L._find_slot()
+
+    assert not [lbl for lbl in slot["labels"] if lbl.startswith("leader-hb")]
+    assert json.loads(slot["description"])[m.K_LEADER_HB] > 0
+    # ...and it still reads back as a live (non-stale) leader.
+    assert L.read_leader("h-1-aaa")["stale"] is False
 
 
 def test_non_main_cannot_claim(store):

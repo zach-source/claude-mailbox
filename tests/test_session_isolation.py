@@ -11,6 +11,8 @@ import itertools
 
 import pytest
 
+import claude_mailbox.leader as L
+import claude_mailbox.model as m
 import claude_mailbox.server as srv
 
 
@@ -117,6 +119,12 @@ def fake_bd(monkeypatch):
     fake = FakeBd()
     monkeypatch.setattr(srv, "run_bd", fake.run_bd)
     monkeypatch.setattr(srv, "run_bd_json", fake.run_bd_json)
+    # leader.py holds its own module-level references to the same seam, and a
+    # heartbeat always crosses into it (_heartbeat_once → L.heartbeat_leader).
+    # Without these, "unit" tests here spawned real `bd` against the shared
+    # production beads_global — slow, and mutating.
+    monkeypatch.setattr(L, "run_bd", fake.run_bd)
+    monkeypatch.setattr(L, "run_bd_json", fake.run_bd_json)
     monkeypatch.setattr(
         srv,
         "create",
@@ -226,6 +234,44 @@ def test_active_http_connection_keeps_heartbeating():
 
     assert "conn-active" in srv._SESSIONS
     assert srv.run_bd_json("show", bead_id)[0]["status"] == "open"
+
+
+def test_heartbeats_do_not_grow_the_database(fake_bd, monkeypatch):
+    """Regression guard for the beads_global bloat: a steady-state heartbeat must
+    issue only `bd update` description writes (one for the session bead, one for
+    the leader slot) and *no* `bd set-state`.
+
+    `bd set-state` mints an event bead and rewrites a `<dim>:<val>` label on every
+    call — measured at ~3.8 Dolt commits + 1 issue row per write. Storing the
+    per-beat `hb` timestamp that way made 21,320 of 21,353 issues in beads_global
+    heartbeat events (85k commits / 2.9GB). Heartbeats now live in the bead's
+    description JSON (model.K_HB), which is 0 commits on a --no-history bead.
+    """
+    calls: list[tuple] = []
+
+    def recording(*a, **kw):
+        calls.append(a)
+        return fake_bd.run_bd(*a, **kw)
+
+    # Re-wrap both seams the fixture installed: a beat crosses into the leader
+    # half, which is exactly where the second per-beat set-state used to be.
+    monkeypatch.setattr(srv, "run_bd", recording)
+    monkeypatch.setattr(L, "run_bd", recording)
+
+    st = srv._state_for("conn-hb")
+    srv._register_impl(st, "measure the beat")
+    calls.clear()  # registration is one-off; only the steady state is unbounded
+
+    for _ in range(10):
+        srv._hb_tick_once()
+
+    assert [c for c in calls if c[0] == "set-state"] == []
+    # Two description writes per beat and nothing else that grows: the session
+    # bead's hb, and the leader slot's leader_hb.
+    assert len([c for c in calls if c[0] == "update"]) == 20
+    # ...and both heartbeats read back as fresh, not stale.
+    assert not m.is_stale(m.hb_of(srv.run_bd_json("show", st.bead_id)[0]))
+    assert L.read_leader(st.sid)["stale"] is False
 
 
 @pytest.mark.usefixtures("fake_bd")

@@ -6,6 +6,7 @@ AND/OR (NOT `field:value`), e.g. `label=mailbox:session AND status=open`.
 
 from __future__ import annotations
 
+import json
 import re
 import time
 
@@ -17,22 +18,50 @@ L_DM = "dm"  # marks a message as a direct message
 L_DELEGATION = "mailbox:delegation"  # leader → secondary work item
 L_REQUEST = "mailbox:request"  # blocking info-request (answered via comment + close)
 
-# state dimensions (bd set-state <id> <dim>=<val>)
+# state dimensions (bd set-state <id> <dim>=<val>). Reserved for *low-cardinality*
+# facts only: set-state mints an event bead and rewrites a `<dim>:<val>` label on
+# every call, so a value that changes each beat costs ~3 Dolt commits + one issue
+# row per write. That is how heartbeats once grew to 99% of beads_global (21,320
+# of 21,353 issues, 85k Dolt commits, 2.9GB) — see K_HB below.
 D_STATUS = "status"  # active | idle | blocked | done
 D_ROLE = "role"  # leader | secondary
-D_HB = "hb"  # heartbeat: raw unix-epoch seconds
 D_LEADER = "leader"  # on the slot bead: <sid> | vacant
 D_LEADER_BRANCH = "leader-branch"
-D_LEADER_HB = "leader-hb"
+
+# Heartbeats are raw unix-epoch seconds kept in the bead's *description JSON*
+# (see meta_of), NOT as a state dimension: a monotonic timestamp has no audit
+# value, and `bd update -d` is a single write with no event bead and no label
+# churn. The session bead carries K_HB; the leader slot bead carries K_LEADER_HB.
+K_HB = "hb"
+K_LEADER_HB = "leader_hb"
 
 LEADER_BRANCH = "main"  # only a session on this branch may lead
-HB_BUCKET = 30  # heartbeat granularity, seconds
+HB_BUCKET = 60  # heartbeat granularity, seconds
 STALE_BEATS = 3  # missed beats before a session/leader is stale
 STALE_SECONDS = HB_BUCKET * STALE_BEATS
 
 
 def hb_now() -> int:
     return int(time.time())
+
+
+def meta_of(bead: dict) -> dict:
+    """Parse a bead's description as the JSON blob mailbox stores there."""
+    try:
+        meta = json.loads(bead.get("description") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def hb_of(bead: dict, key: str = K_HB) -> int | None:
+    """Read a heartbeat epoch out of a bead's description JSON, or None."""
+    v = meta_of(bead).get(key)
+    if isinstance(v, bool):  # bool is an int subclass — not a timestamp
+        return None
+    if isinstance(v, int):
+        return v
+    return int(v) if isinstance(v, str) and v.isdigit() else None
 
 
 def hb_age_seconds(hb: int | None) -> float:

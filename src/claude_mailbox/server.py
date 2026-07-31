@@ -54,7 +54,7 @@ mcp = FastMCP("claude-mailbox", instructions=_CHANNEL_INSTRUCTIONS)
 ch.enable_channel(mcp)
 
 # How often the channel-delivery thread checks for new inbound to push (seconds).
-# Faster than the 30s heartbeat so peer messages feel like interrupts.
+# Faster than the HB_BUCKET heartbeat so peer messages feel like interrupts.
 CHANNEL_POLL_SECONDS = 4
 
 
@@ -74,6 +74,7 @@ class _SessionState:
         )  # message bead ids already pushed to this connection
         self._lock = threading.Lock()
         self.last_activity = time.time()  # last real tool call from this connection
+        self.role: str | None = None  # last role written; skips no-op set-state beats
 
     def subscribed_channels(self) -> list[str]:
         return ["general", f"{self.git.project}", "leader"]
@@ -153,13 +154,8 @@ def _find_session(sid: str) -> dict | None:
 
 def _session_view(bead: dict) -> dict:
     st = L.states_of(bead)
-    desc = bead.get("description") or "{}"
-    try:
-        meta = json.loads(desc)
-    except (json.JSONDecodeError, TypeError):
-        meta = {}
-    hb = st.get(m.D_HB)
-    hb_int = int(hb) if hb and str(hb).isdigit() else None
+    meta = m.meta_of(bead)
+    hb_int = m.hb_of(bead)
     return {
         "sid": meta.get("sid"),
         "project": meta.get("project"),
@@ -177,36 +173,33 @@ def _heartbeat_once(st: _SessionState) -> dict:
     if not st.bead_id:
         return {"ok": False}
     st.git = detect_git()
-    if (
-        st.meta.get("branch") != st.git.branch
-        or st.meta.get("worktree") != st.git.worktree
-        or st.meta.get("project") != st.git.project
-    ):
-        st.meta["branch"] = st.git.branch
-        st.meta["worktree"] = st.git.worktree
-        st.meta["project"] = st.git.project
-        run_bd(
-            "update", st.bead_id, "-d", json.dumps(st.meta), actor=st.sid, check=False
-        )
-    run_bd(
-        "set-state",
-        st.bead_id,
-        f"{m.D_HB}={m.hb_now()}",
-        "--reason",
-        "hb",
-        actor=st.sid,
-    )
+    st.meta["branch"] = st.git.branch
+    st.meta["worktree"] = st.git.worktree
+    st.meta["project"] = st.git.project
+    st.meta[m.K_HB] = m.hb_now()
+    # One description write carries both the heartbeat and any git drift. This
+    # deliberately is NOT `bd set-state` — see model.py K_HB for why (event-bead
+    # + label churn per beat is what bloated beads_global).
+    run_bd("update", st.bead_id, "-d", json.dumps(st.meta), actor=st.sid)
     with st._lock:
         lead = L.heartbeat_leader(st.sid, st.git.branch, st.sid)
-        run_bd(
-            "set-state",
-            st.bead_id,
-            f"{m.D_ROLE}={lead['role']}",
-            "--reason",
-            "role sync",
-            actor=st.sid,
-            check=False,
-        )
+        # Only on an actual role *change*. Role is low-cardinality (86 changes
+        # across the whole history), so set-state is the right home for it — but
+        # calling it unconditionally every beat spends a bd subprocess to
+        # rediscover that nothing changed, and leans on bd's no-op dedup to keep
+        # it from minting an event bead. Decide here instead.
+        if lead["role"] != st.role:
+            ok = run_bd(
+                "set-state",
+                st.bead_id,
+                f"{m.D_ROLE}={lead['role']}",
+                "--reason",
+                "role sync",
+                actor=st.sid,
+                check=False,
+            )
+            if ok:  # check=False returns "" on failure — retry on the next beat
+                st.role = lead["role"]
     return {"ok": True, "role": lead["role"]}
 
 
@@ -254,10 +247,7 @@ def _hb_loop() -> None:
 def _reap_stale(actor_sid: str) -> None:
     """Close session beads whose heartbeat is >10x stale (crashed sessions)."""
     for row in run_bd_json("query", f"label={m.L_SESSION} AND status=open") or []:
-        st = L.states_of(row)
-        hb = st.get(m.D_HB)
-        hb_int = int(hb) if hb and str(hb).isdigit() else None
-        if m.hb_age_seconds(hb_int) > m.STALE_SECONDS * 10:
+        if m.hb_age_seconds(m.hb_of(row)) > m.STALE_SECONDS * 10:
             run_bd(
                 "set-state",
                 row["id"],
@@ -411,6 +401,7 @@ def _register_impl(st: _SessionState, objective: str) -> dict:
         "worktree": g.worktree,
         "objective": objective,
         "machine": hostname(),
+        m.K_HB: m.hb_now(),
     }
     st.meta = meta
     title = f"[session] {g.project}@{g.branch} — {objective}"[:200]
@@ -431,19 +422,24 @@ def _register_impl(st: _SessionState, objective: str) -> dict:
         ),
         actor=st.sid,
     ).strip()
+    # --no-history: this bead's description is rewritten every HB_BUCKET for the
+    # session's whole life, and none of those revisions are worth a Dolt commit.
+    # Measured: 0 commits per heartbeat with the flag, ~1 without.
+    #
+    # Caveat: bd implements this by demoting the bead to a *wisp* (verified:
+    # "bd: demote <id> to wisp" in dolt_log, and the row moves to the `wisps`
+    # table). Verified that `bd query label=... AND status=open` still returns it
+    # with its description intact, so list_sessions/_reap_stale are unaffected —
+    # and mailbox already depends on that for its ephemeral message beads. What
+    # is NOT established is whether wisp TTL compaction can reap a *live*
+    # session's bead; if presence ever starts dropping sessions that are still
+    # heartbeating, this flag is the first thing to suspect.
+    run_bd("update", st.bead_id, "--no-history", actor=st.sid, check=False)
     run_bd("update", st.bead_id, "-d", json.dumps(meta), actor=st.sid, check=False)
     run_bd(
         "set-state",
         st.bead_id,
         f"{m.D_STATUS}=active",
-        "--reason",
-        "start",
-        actor=st.sid,
-    )
-    run_bd(
-        "set-state",
-        st.bead_id,
-        f"{m.D_HB}={m.hb_now()}",
         "--reason",
         "start",
         actor=st.sid,
@@ -459,6 +455,7 @@ def _register_impl(st: _SessionState, objective: str) -> dict:
             actor=st.sid,
             check=False,
         )
+        st.role = lead["role"]
     _reap_stale(st.sid)
     _seed_seen(st)  # only push messages that arrive after we join
     _ensure_background_threads()

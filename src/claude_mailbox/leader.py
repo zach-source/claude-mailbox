@@ -1,9 +1,13 @@
 """Leadership election over a single well-known 'leader-slot' bead.
 
 Invariant: at most one leader; the session on `main` wins. The slot bead's
-state dimensions (leader / leader-branch / leader-hb) are the source of truth —
-`bd set-state` is atomic and event-backed, so a losing racer is always
-detectable on read-back. Tiebreak on simultaneous claims: `claim` runs a
+state dimensions (leader / leader-branch) are the source of truth — `bd set-state`
+is atomic and event-backed, so a losing racer is always detectable on read-back.
+The leader's heartbeat is *not* a state dimension (it lives in the slot's
+description JSON as `leader_hb`); it is liveness, not an election decision, and
+at set-state's cost per write it would dominate the database.
+
+Tiebreak on simultaneous claims: `claim` runs a
 bounded convergent loop on the smallest-sid rule — a contending sid keeps
 rewriting itself as leader until it reads back its own sid with no smaller sid
 contesting, while any larger sid yields as soon as it observes a smaller
@@ -13,6 +17,7 @@ coordinator.
 
 from __future__ import annotations
 
+import json
 import time
 
 from . import model as m
@@ -27,7 +32,7 @@ def states_of(bead: dict) -> dict[str, str]:
     """Extract state dimensions from a bead's `dimension:value` labels."""
     # Only these known dimensions are surfaced — a new `set-state` dimension
     # won't appear here until it's added to `known`.
-    known = {m.D_STATUS, m.D_ROLE, m.D_HB, m.D_LEADER, m.D_LEADER_BRANCH, m.D_LEADER_HB}
+    known = {m.D_STATUS, m.D_ROLE, m.D_LEADER, m.D_LEADER_BRANCH}
     out: dict[str, str] = {}
     for lbl in _labels(bead):
         if ":" in lbl:
@@ -66,6 +71,12 @@ def ensure_slot(actor: str) -> str:
         if r["id"] != bid:
             run_bd("close", r["id"], actor=actor, check=False)
     if not slot:
+        # --no-history: _refresh rewrites this bead's description every beat for
+        # as long as anyone leads; those revisions aren't worth Dolt commits.
+        # Only on creation — see server.py's _register_impl for the wisp-demotion
+        # caveat this shares. A slot bead created before this change keeps costing
+        # ~1 commit/beat until migrated by hand (`bd update <slot> --no-history`).
+        run_bd("update", bid, "--no-history", actor=actor, check=False)
         run_bd(
             "set-state",
             bid,
@@ -83,8 +94,7 @@ def read_leader(actor: str) -> dict:
         return {"vacant": True, "leader_sid": None, "branch": None, "stale": True}
     st = states_of(slot)
     leader = st.get(m.D_LEADER, "vacant")
-    hb = st.get(m.D_LEADER_HB)
-    hb_int = int(hb) if hb and hb.isdigit() else None
+    hb_int = m.hb_of(slot, m.K_LEADER_HB)
     vacant = leader == "vacant" or not leader
     return {
         "vacant": vacant,
@@ -147,12 +157,15 @@ def _write_leader(bid: str, sid: str, branch: str, actor: str, reason: str):
 
 
 def _refresh(bid: str, sid: str, branch: str, actor: str):
+    # Description JSON, not a state dimension — this fires every HB_BUCKET for
+    # the whole life of a leader, so it must not mint an event bead (see model.py
+    # K_LEADER_HB). The slot's description holds nothing else, so a whole-blob
+    # rewrite is safe under concurrent claims.
     run_bd(
-        "set-state",
+        "update",
         bid,
-        f"{m.D_LEADER_HB}={m.hb_now()}",
-        "--reason",
-        "leader hb",
+        "-d",
+        json.dumps({m.K_LEADER_HB: m.hb_now()}),
         actor=actor,
     )
 

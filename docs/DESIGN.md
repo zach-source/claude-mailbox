@@ -17,7 +17,8 @@ Everything is a bead in the shared `beads_global` DB. Three kinds:
   Labels: `mailbox:message`, `channel:<name>` (broadcast) or `dm` + assignee=`<sid>`
   (DM), `from:<sid>`. Text carried in the JSON description.
 - **Leader-slot bead** — a singleton (`mailbox:leader-slot`) that is the lock.
-  State: `leader=<sid>|vacant`, `leader-branch`, `leader-hb`.
+  State: `leader=<sid>|vacant`, `leader-branch`. Its `leader_hb` is description
+  JSON, not state — see §4.
 - **Delegation bead** — leader→secondary work. Type `task`, label
   `mailbox:delegation`, assignee=target. Not ephemeral (real work).
 
@@ -39,8 +40,20 @@ the loser sets `role=secondary`. Leaving `main` → release + broadcast on
 allowed; secondaries then act autonomously but conservatively.
 
 ## 4. Presence & liveness
-Server-driven heartbeat every 30s (`set-state hb=<epoch//30>`), not model-driven.
-`stale = age > 90s` (3 missed beats). Sessions >10× stale are reaped
+Server-driven heartbeat every 60s, not model-driven. The `hb` epoch is written
+into the bead's **description JSON** via `bd update`, on a bead marked
+`--no-history`; the session and leader-slot beads are the only ones written at
+this cadence.
+
+> Not `bd set-state`. set-state mints an event bead *and* rewrites a
+> `<dim>:<val>` label per call — measured at ~3.8 Dolt commits + 1 issue row per
+> write, versus 0 commits for a description write on a `--no-history` bead.
+> Heartbeating through set-state grew `beads_global` to 21,320 heartbeat event
+> beads out of 21,353 issues (85k Dolt commits, 2.9GB) in eight days. Reserve
+> set-state for genuinely low-cardinality facts (`status`, `role`, `leader`);
+> anything that changes every beat belongs in the description.
+
+`stale = age > 180s` (3 missed beats). Sessions >10× stale are reaped
 (`status=done` + `close`) opportunistically on any register. Messages are
 `--ephemeral`; bd TTL compaction cleans them. `atexit`/SIGTERM → clean deregister.
 
@@ -89,7 +102,9 @@ than per-connection thread lifecycle management and equally correct.
   periodic sync; leave as a user decision.
 - **Identity is unauthenticated** (`--actor`/sid are self-asserted) — fine for a
   single-user fleet; no auth.
-- **Query volume**: ~4 bd calls/min/session (heartbeat + inbox). Fine <20 sessions.
+- **Query volume**: ~2 bd calls/min/session (heartbeat + inbox). Fine <20 sessions.
+  Write *volume* matters more than call count: keep steady-state writes off
+  `set-state` and on `--no-history` beads, or the DB grows without bound.
 - **Blocking `request_info`** would hold a model turn up to its timeout; prefer an
   async `check_request` escape hatch when implemented.
 - **register via SessionStart hook** (guaranteed) vs skill (probabilistic):
