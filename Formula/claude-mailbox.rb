@@ -20,8 +20,8 @@ class ClaudeMailbox < Formula
   # <prefix>/lib/pythonX.Y (see bd.py _default_workspace), which no installed
   # build can use. Refresh both lines on every release:
   #   curl -sL <url> | shasum -a 256
-  url "https://github.com/zach-source/claude-mailbox/archive/refs/tags/v0.6.0.tar.gz"
-  sha256 "10ae7c97ef30396a62d9013f7f5ebb205985b689d778b1253176fcc19f267561"
+  url "https://github.com/zach-source/claude-mailbox/archive/refs/tags/v0.6.1.tar.gz"
+  sha256 "3a4caf8a21c6a69628319f6789b48843efadad6066fb6e195f84a2a630e3286c"
   license "MIT"
   head "https://github.com/zach-source/claude-mailbox.git", branch: "main"
 
