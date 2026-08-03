@@ -1,6 +1,6 @@
 [project]
 name = "claude-mailbox"
-version = "0.6.1"
+version = "0.7.0"
 description = "MCP mailbox for cross-talk between concurrent Claude Code sessions, backed by beads (bd)"
 readme = "README.md"
 license = "MIT"
