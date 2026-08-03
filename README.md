@@ -214,6 +214,11 @@ addressed to this session (and broadcasts on subscribed channels: `general`,
 `<project>`, `leader`) and emits the notification. The existing `send_dm` /
 `respond_info` / `broadcast` tools are the reply side.
 
+`broadcast` posts to the sender's own `<project>` channel unless you name one, so
+a message only interrupts sessions working in the same repo. Reaching every
+project on the machine is the explicit `channel="general"` (or `mailbox say -c
+general`).
+
 **To actually receive channel pushes**, start Claude Code with the research-preview
 dev flag so it loads the mailbox as a channel (custom channels aren't allowlisted yet):
 ```bash

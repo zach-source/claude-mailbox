@@ -6,6 +6,7 @@ import pytest
 
 import claude_mailbox.model as m
 import claude_mailbox.server as srv
+from claude_mailbox.identity import GitContext
 
 
 @pytest.fixture(autouse=True)
@@ -49,6 +50,30 @@ def test_read_channel_sorts_newest_first(monkeypatch):
 
     assert [msg["id"] for msg in msgs] == ["b-3", "b-2", "b-1"]
     assert msgs[0]["ts"] == "2024-01-03T00:00:00Z"
+
+
+def _broadcast_labels(monkeypatch, **kwargs) -> list[str]:
+    st = srv._current_state()
+    monkeypatch.setattr(
+        st, "git", GitContext(project="my-repo", branch="main", worktree="/tmp")
+    )
+    captured = {}
+    monkeypatch.setattr(
+        srv, "create", lambda title, **kw: (captured.update(kw), "b-1")[1]
+    )
+    assert srv.broadcast(**kwargs) == {"message_id": "b-1"}
+    return captured["labels"]
+
+
+def test_broadcast_defaults_to_the_senders_project(monkeypatch):
+    labels = _broadcast_labels(monkeypatch, text="hi")
+    assert m.channel_label("my-repo") in labels
+    assert m.channel_label("general") not in labels
+
+
+def test_broadcast_reaches_all_projects_only_when_asked(monkeypatch):
+    labels = _broadcast_labels(monkeypatch, text="hi", channel="general")
+    assert m.channel_label("general") in labels
 
 
 def test_read_channel_rejects_invalid_channel():

@@ -47,7 +47,10 @@ _CHANNEL_INSTRUCTIONS = (
     "for a dm reply with send_dm to the from_sid; for a broadcast just take it into "
     "account. Register once at session start with register_session so peers can see "
     "you and reach you. There is a single leader (the session on the main branch); "
-    "if you are secondary, defer to it."
+    "if you are secondary, defer to it. Broadcast sparingly — it interrupts every "
+    "peer; prefer send_dm when one session needs to know. broadcast defaults to "
+    'your own project\'s channel; only pass channel="general" when sessions in '
+    "other repos genuinely need the message."
 )
 
 mcp = FastMCP("claude-mailbox", instructions=_CHANNEL_INSTRUCTIONS)
@@ -626,13 +629,17 @@ def release_leadership() -> dict:
 
 
 @mcp.tool
-def broadcast(text: str, channel: str = "general") -> dict:
-    """Broadcast a message to a channel that all sessions can read."""
-    if not m.valid_token(channel):
-        return {"ok": False, "error": "invalid channel: must match [A-Za-z0-9._-]"}
+def broadcast(text: str, channel: str | None = None) -> dict:
+    """Broadcast a message to a channel. Defaults to this session's own project
+    channel, so only sessions in the same repo are interrupted. Pass
+    channel="general" to reach every project on the machine — do that only when
+    the other projects genuinely need to know."""
     st = _current_state()
     if (err := _require_registered(st)) is not None:
         return err
+    channel = channel or st.git.project
+    if not m.valid_token(channel):
+        return {"ok": False, "error": "invalid channel: must match [A-Za-z0-9._-]"}
     payload = json.dumps({"text": text, "from": st.sid, "channel": channel})
     mid = create(
         f"[msg] {channel}: {text}"[:200],

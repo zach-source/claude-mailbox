@@ -16,7 +16,7 @@ from pathlib import Path
 from . import leader as L
 from . import model as m
 from .bd import WORKSPACE, BdError, create, run_bd, run_bd_json
-from .identity import hostname
+from .identity import detect_git, hostname
 
 
 def _who(_args) -> int:
@@ -45,6 +45,7 @@ def _leader(_args) -> int:
 
 
 def _say(args) -> int:
+    args.channel = args.channel or detect_git().project
     if not m.valid_token(args.channel):
         print("error: invalid channel: must match [A-Za-z0-9._-]", file=sys.stderr)
         return 2
@@ -84,7 +85,13 @@ def main(argv=None) -> int:
 
     say = sub.add_parser("say", help="broadcast to a channel")
     say.add_argument("text")
-    say.add_argument("-c", "--channel", default="general")
+    say.add_argument(
+        "-c",
+        "--channel",
+        default=None,
+        help="channel to post on (default: this repo's project channel; "
+        "'general' reaches every project)",
+    )
     say.set_defaults(fn=_say)
 
     inb = sub.add_parser("inbox", help="show messages addressed to a sid")
