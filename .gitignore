@@ -15,6 +15,9 @@ uv.lock
 *.db
 .beads-credential-key
 
+# local MCP server wiring (paths/tokens are per-machine)
+.mcp.json
+
 # nix build output symlink
 result
 result-*
